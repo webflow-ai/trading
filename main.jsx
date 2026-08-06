@@ -500,6 +500,9 @@ function SpotChart({ backendUrl, symbol }) {
 
   const mergeLiveTick = useCallback(async () => {
     if (!backendUrl || !cfg.liveMerge) return;
+    if (!marketStatus().open) return; // frozen at the close — NSE keeps serving the last
+    // snapshot with a *fresh* timestamp even after hours, which would otherwise create
+    // phantom flat candles marching forward at the current wall-clock time.
     try {
       const base = backendUrl.replace(/\/$/, "");
       const res = await fetch(`${base}/api/optionchain/today?symbol=${symbol}&n=1`);
@@ -612,7 +615,10 @@ function SpotChart({ backendUrl, symbol }) {
   // used to merge live ticks.
   useEffect(() => {
     if (!cfg.liveMerge) { setCloseIn(null); return; }
-    const tick = () => setCloseIn(secondsToBucketClose(new Date(), cfg.bucketMinutes));
+    const tick = () => {
+      if (!marketStatus().open) { setCloseIn(null); return; } // nothing left to count down to once shut
+      setCloseIn(secondsToBucketClose(new Date(), cfg.bucketMinutes));
+    };
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
@@ -670,6 +676,14 @@ function SpotChart({ backendUrl, symbol }) {
               borderRadius: 999, padding: "3px 9px", whiteSpace: "nowrap",
             }}>
               closes in {Math.floor(closeIn / 60)}:{String(closeIn % 60).padStart(2, "0")}
+            </span>
+          )}
+          {cfg.liveMerge && !marketStatus().open && (
+            <span style={{
+              fontFamily: MONO, fontSize: 11, color: T.muted, border: `1px solid ${T.line}`,
+              borderRadius: 999, padding: "3px 9px", whiteSpace: "nowrap",
+            }}>
+              ● Market closed — showing last close
             </span>
           )}
           <div style={{ display: "flex", gap: 4 }}>
