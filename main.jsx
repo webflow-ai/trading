@@ -1188,10 +1188,20 @@ function OptionChain({ backendUrl, symbol }) {
   );
 }
 
-// Same host the page itself was loaded from, port 8000 — works whether
-// you're on localhost or hitting the machine's LAN IP from another device,
-// without hardcoding an address that only means "this machine" to itself.
-const DEFAULT_BACKEND_URL = `http://${typeof window !== "undefined" ? window.location.hostname : "127.0.0.1"}:8000`;
+// Local dev runs the frontend (port 5500) and backend (port 8000) as two
+// separate servers, so localhost/LAN-IP hosts need that explicit port. A
+// real deployment (Vercel, custom domain, etc.) serves the API from the
+// exact same origin under /api — appending :8000 there would be wrong
+// (nothing listens on that port, and it'd even break http vs https).
+function detectDefaultBackendUrl() {
+  if (typeof window === "undefined") return "http://127.0.0.1:8000";
+  const { hostname, protocol, origin } = window.location;
+  const isLocalDev = hostname === "localhost" || hostname === "127.0.0.1" ||
+    /^192\.168\.\d+\.\d+$/.test(hostname) || /^10\.\d+\.\d+\.\d+$/.test(hostname) ||
+    /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(hostname);
+  return isLocalDev ? `${protocol}//${hostname}:8000` : origin;
+}
+const DEFAULT_BACKEND_URL = detectDefaultBackendUrl();
 
 export default function App() {
   const [symbol, setSymbol] = useState("NIFTY");
