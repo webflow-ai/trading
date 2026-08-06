@@ -11,3 +11,6 @@ bin/
 
 # vercel
 .vercel
+
+# claude code local state
+.claude/

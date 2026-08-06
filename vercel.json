@@ -9,5 +9,8 @@
     { "src": "/main.jsx", "dest": "/main.jsx" },
     { "src": "/", "dest": "/index.html" },
     { "src": "/(.*)", "dest": "/$1" }
+  ],
+  "crons": [
+    { "path": "/api/cron/poll", "schedule": "*/5 4-9 * * 1-5" }
   ]
 }

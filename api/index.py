@@ -6,11 +6,12 @@ window that only helps on "warm" invocations — Vercel doesn't guarantee
 warm reuse between requests, unlike a normal long-running server).
 
 There is intentionally no background scheduler here: serverless functions
-only run in response to a request, so nothing can poll NSE on a timer the
-way the original local backend.py did. PCR history is no longer accumulated
-server-side either — /api/pcr/today returns just the current reading, and
-the frontend builds its own local time series from repeated polls (the same
-pattern the option-chain candle chart already uses).
+only run in response to a request. PCR history is instead persisted to a
+Redis-compatible store (Upstash, via Vercel's KV integration) so any visitor
+sees the full day's history, not just what accumulated since they opened
+the tab — /api/pcr/today appends the current reading on every fresh fetch,
+/api/pcr/history reads it back, and /api/cron/poll (wired to a Vercel Cron
+schedule) keeps it building even with nobody actively viewing the page.
 
 ⚠️ NSE gotcha (same one from backend.py, now higher-stakes): NSE actively
 blocks datacenter/cloud IPs. This code primes cookies + sends browser-like
@@ -21,6 +22,7 @@ Yahoo-Finance-backed /api/candles route doesn't have this problem.
 """
 
 import os
+import json
 import datetime as dt
 
 import httpx
@@ -79,6 +81,46 @@ pcr_cache: dict = {}     # pcr_cache[symbol] = {"updatedAt", "expiry", "pcrOi", 
 expiry_cache: dict = {}  # expiry_cache[symbol] = {"date", "expiries"}
 
 _client: httpx.AsyncClient | None = None
+
+# ---------------- persistent PCR history (Upstash Redis via Vercel KV) ----------------
+KV_URL = os.getenv("KV_REST_API_URL")
+KV_TOKEN = os.getenv("KV_REST_API_TOKEN")
+PCR_HISTORY_TTL_SECONDS = 2 * 24 * 3600  # keep ~2 trading days, then let old keys expire
+
+
+async def redis_cmd(*args):
+    """Raw call to Upstash's REST API (a plain HTTP POST with the Redis
+    command as a JSON array) — no redis client library needed, and it works
+    fine from a serverless function with no persistent connection."""
+    if not (KV_URL and KV_TOKEN):
+        return None
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(KV_URL, json=list(args), headers={"Authorization": f"Bearer {KV_TOKEN}"})
+        r.raise_for_status()
+        return r.json().get("result")
+
+
+async def push_pcr_snapshot(symbol: str, day: str, snap: dict):
+    if not (KV_URL and KV_TOKEN):
+        return
+    key = f"pcr:{symbol}:{day}"
+    try:
+        await redis_cmd("RPUSH", key, json.dumps(snap))
+        await redis_cmd("EXPIRE", key, PCR_HISTORY_TTL_SECONDS)
+    except Exception as e:
+        print(f"redis push failed for {key}: {e}")
+
+
+async def get_pcr_history(symbol: str, day: str) -> list:
+    if not (KV_URL and KV_TOKEN):
+        return []
+    key = f"pcr:{symbol}:{day}"
+    try:
+        raw = await redis_cmd("LRANGE", key, 0, -1)
+        return [json.loads(x) for x in (raw or [])]
+    except Exception as e:
+        print(f"redis history fetch failed for {key}: {e}")
+        return []
 
 
 async def get_client() -> httpx.AsyncClient:
@@ -292,11 +334,31 @@ async def upstox_callback(code: str = Query(None), error: str = Query(None)):
         return f"<h3>Token exchange failed: {e}</h3>"
 
 
+async def fetch_and_record_pcr(symbol: str, now: dt.datetime) -> dict:
+    """Fetch a fresh PCR reading, update the in-memory cache, and append it
+    to the persistent Redis history (best-effort — a Redis outage shouldn't
+    break the live reading, just the history)."""
+    expiry = await get_nearest_expiry(symbol)
+    oc = await fetch_option_chain_for_expiry(symbol, expiry)
+    pcr = compute_pcr(oc, target_expiry=expiry)
+    cached = {
+        "updatedAt": now.isoformat(), "expiry": pcr["expiry"],
+        "pcrOi": pcr["pcrOi"], "pcrVol": pcr["pcrVol"],
+        "putOi": pcr["putOi"], "callOi": pcr["callOi"],
+    }
+    pcr_cache[symbol] = cached
+    await push_pcr_snapshot(symbol, now.date().isoformat(), {
+        "t": now.strftime("%H:%M"), "pcrOi": pcr["pcrOi"], "pcrVol": pcr["pcrVol"],
+        "putOi": pcr["putOi"], "callOi": pcr["callOi"],
+    })
+    return cached
+
+
 @app.get("/api/pcr/today")
 async def pcr_today(symbol: str = Query("NIFTY")):
-    """Current PCR reading only — no server-side history. Fetched fresh (or
-    reused briefly on a warm invocation); the frontend accumulates its own
-    time series from repeated polls, same as the candle chart already does."""
+    """Current PCR reading, refreshed on-demand (or reused briefly on a warm
+    invocation). Each fresh fetch also gets appended to Redis — see
+    /api/pcr/history for the persisted full-day time series."""
     symbol = symbol.upper()
     now = dt.datetime.now(IST)
     cached = pcr_cache.get(symbol)
@@ -307,21 +369,38 @@ async def pcr_today(symbol: str = Query("NIFTY")):
 
     if stale:
         try:
-            expiry = await get_nearest_expiry(symbol)
-            oc = await fetch_option_chain_for_expiry(symbol, expiry)
-            pcr = compute_pcr(oc, target_expiry=expiry)
-            cached = {
-                "updatedAt": now.isoformat(), "expiry": pcr["expiry"],
-                "pcrOi": pcr["pcrOi"], "pcrVol": pcr["pcrVol"],
-                "putOi": pcr["putOi"], "callOi": pcr["callOi"],
-            }
-            pcr_cache[symbol] = cached
+            cached = await fetch_and_record_pcr(symbol, now)
         except Exception as e:
             print(f"[{now:%H:%M:%S}] {symbol} pcr fetch failed: {e}")
             if cached is None:
                 cached = {"updatedAt": None, "expiry": "", "pcrOi": None, "pcrVol": None, "putOi": None, "callOi": None}
 
     return {"symbol": symbol, **cached}
+
+
+@app.get("/api/pcr/history")
+async def pcr_history(symbol: str = Query("NIFTY")):
+    """The current trading day's persisted PCR readings, so any visitor sees
+    the full day rather than just what accumulated since they opened the tab."""
+    symbol = symbol.upper()
+    day = dt.datetime.now(IST).date().isoformat()
+    snapshots = await get_pcr_history(symbol, day)
+    return {"symbol": symbol, "date": day, "snapshots": snapshots}
+
+
+@app.get("/api/cron/poll")
+async def cron_poll():
+    """Vercel Cron target — keeps PCR history building even with nobody
+    actively viewing the page. See vercel.json's "crons" entry."""
+    now = dt.datetime.now(IST)
+    results = {}
+    for sym in SYMBOLS:
+        try:
+            await fetch_and_record_pcr(sym, now)
+            results[sym] = "ok"
+        except Exception as e:
+            results[sym] = f"failed: {e}"
+    return {"ok": True, "updatedAt": now.isoformat(), "results": results}
 
 
 @app.get("/api/expiries")

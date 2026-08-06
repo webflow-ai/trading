@@ -1260,7 +1260,35 @@ export default function App() {
     } finally { setLoading(false); }
   }, [backendUrl, symbol]);
 
-  useEffect(() => { setSnapshots([]); }, [symbol, backendUrl]);
+  // Seed from the backend's persisted full-day history (so any visitor sees
+  // the whole day, not just what's accumulated since they opened the tab).
+  // Merges rather than overwrites, in case the live load() below already
+  // appended a fresher reading before this resolves.
+  useEffect(() => {
+    let cancelled = false;
+    setSnapshots([]);
+    (async () => {
+      if (!backendUrl) return;
+      try {
+        const base = backendUrl.replace(/\/$/, "");
+        const res = await fetch(`${base}/api/pcr/history?symbol=${symbol}`);
+        if (!res.ok || cancelled) return;
+        const json = await res.json();
+        const hist = (json.snapshots || []).map((s) => ({
+          t: s.t, pcrOi: num(s.pcrOi), pcrVol: num(s.pcrVol), putOi: num(s.putOi), callOi: num(s.callOi),
+        })).filter((s) => s.t);
+        if (!hist.length || cancelled) return;
+        setSnapshots((prev) => {
+          const histTimes = new Set(hist.map((h) => h.t));
+          return [...hist, ...prev.filter((p) => !histTimes.has(p.t))];
+        });
+      } catch {
+        /* history is a nice-to-have seed; live polling still works without it */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [symbol, backendUrl]);
+
   useEffect(() => { load(); }, [load]);
 
   // auto refresh during market hours
