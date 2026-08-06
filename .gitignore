@@ -1,0 +1,13 @@
+# secrets — never commit
+.env
+
+# python
+__pycache__/
+*.pyc
+
+# local dev artifacts
+*.log
+bin/
+
+# vercel
+.vercel
