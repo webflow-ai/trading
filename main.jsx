@@ -1228,6 +1228,20 @@ function OptionChain({ backendUrl, symbol }) {
         </div>
       )}
 
+      {rows.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 8px 10px", flexWrap: "wrap" }}>
+          <label style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>PCR history for strike:</label>
+          <select value={selectedStrike ?? ""} onChange={(e) => setSelectedStrike(e.target.value ? Number(e.target.value) : null)}
+            style={{
+              background: T.panel2, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 6,
+              padding: "4px 8px", fontFamily: MONO, fontSize: 11,
+            }}>
+            <option value="">— select a strike —</option>
+            {rows.map((r) => <option key={r.strike} value={r.strike}>{r.strike}</option>)}
+          </select>
+        </div>
+      )}
+
       <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 650 }}>
           <thead>
