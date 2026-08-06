@@ -1157,12 +1157,13 @@ function OptionChain({ backendUrl, symbol }) {
       )}
 
       <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 580 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 650 }}>
           <thead>
             <tr>
               <th colSpan={3} style={thGroup(T.call)}>Calls</th>
               <th style={thGroup(T.muted)}>Strike</th>
               <th colSpan={3} style={thGroup(T.put)}>Puts</th>
+              <th rowSpan={2} style={{ ...thGroup(T.cyan), verticalAlign: "middle" }}>PCR</th>
             </tr>
             <tr>
               <th style={thCol()}>OI</th><th style={thCol()}>Chg OI</th><th style={thCol()}>Vol</th>
@@ -1173,6 +1174,8 @@ function OptionChain({ backendUrl, symbol }) {
           <tbody>
             {rows.map((r) => {
               const isAtm = r.strike === atmStrike;
+              const strikePcr = r.ceOi ? r.peOi / r.ceOi : null;
+              const pcrColor = strikePcr == null ? T.muted : strikePcr > 1.05 ? T.put : strikePcr < 0.95 ? T.call : T.amber;
               return (
                 <tr key={r.strike} style={{ background: isAtm ? `${T.amber}14` : "transparent" }}>
                   <FlashCell value={r.ceOi} render={fmtOi} />
@@ -1188,11 +1191,14 @@ function OptionChain({ backendUrl, symbol }) {
                   <FlashCell value={r.peOi} render={fmtOi} />
                   <FlashCell value={r.peOiChg} render={(v) => `${v >= 0 ? "+" : ""}${fmtOi(v)}`} />
                   <FlashCell value={r.peVol} render={fmtOi} />
+                  <td style={{ padding: "6px 8px", textAlign: "right", fontFamily: MONO, fontSize: 11, fontWeight: 700, color: pcrColor }}>
+                    {strikePcr == null ? "—" : strikePcr.toFixed(2)}
+                  </td>
                 </tr>
               );
             })}
             {!rows.length && (
-              <tr><td colSpan={7} style={{ padding: 16, textAlign: "center", color: T.muted, fontFamily: MONO, fontSize: 11 }}>No chain data yet</td></tr>
+              <tr><td colSpan={8} style={{ padding: 16, textAlign: "center", color: T.muted, fontFamily: MONO, fontSize: 11 }}>No chain data yet</td></tr>
             )}
           </tbody>
         </table>
