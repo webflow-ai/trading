@@ -357,7 +357,7 @@ async def fetch_and_record_pcr(symbol: str, now: dt.datetime, persist_strikes: b
     same NSE fetch (no extra request) — left off by default since /api/pcr/today
     can be called every few seconds while a tab is open, and writing 10
     strikes' worth of history that often would burn through Redis's free
-    tier fast. Only the 5-min cron poll turns this on."""
+    tier fast. Only the once-daily cron poll turns this on."""
     expiry = await get_nearest_expiry(symbol)
     oc = await fetch_option_chain_for_expiry(symbol, expiry)
     pcr = compute_pcr(oc, target_expiry=expiry)
@@ -426,8 +426,10 @@ async def pcr_history(symbol: str = Query("NIFTY")):
 @app.get("/api/optionchain/history")
 async def optionchain_history(symbol: str = Query("NIFTY"), strike: float = Query(...)):
     """A single strike's PCR (put OI / call OI) over the current trading
-    day, sampled every ~5 min by the cron poll below — only strikes that
-    were within the top-N-near-spot window at poll time have data."""
+    day. Points come from two sources: the once-daily cron poll (guarantees
+    at least one point near market open) and any visitor traffic (each
+    /api/pcr/today fetch persists too) — only strikes that were within the
+    top-N-near-spot window at that moment have data."""
     symbol = symbol.upper()
     day = dt.datetime.now(IST).date().isoformat()
     strike_key = int(round(strike))
@@ -437,9 +439,11 @@ async def optionchain_history(symbol: str = Query("NIFTY"), strike: float = Quer
 
 @app.get("/api/cron/poll")
 async def cron_poll():
-    """Vercel Cron target — keeps PCR (whole-chain and per-strike) history
-    building even with nobody actively viewing the page. See vercel.json's
-    "crons" entry."""
+    """Vercel Cron target — runs once/day shortly after market open (Hobby
+    plan's cron limits don't allow more often; see vercel.json's "crons"
+    entry) so there's always at least one data point even if nobody visits
+    the page all day. Finer intraday granularity comes from visitor traffic:
+    every /api/pcr/today fetch persists a reading too."""
     now = dt.datetime.now(IST)
     results = {}
     for sym in SYMBOLS:

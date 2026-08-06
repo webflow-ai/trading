@@ -1082,7 +1082,7 @@ function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
       const json = await res.json();
       const rows = (json.snapshots || []).filter((s) => s.pcr != null);
       setSnaps(rows);
-      setErr(rows.length ? "" : "No history recorded for this strike yet — persists every ~5 min");
+      setErr(rows.length ? "" : "No history recorded for this strike yet — builds up as the page is visited through the day");
     } catch (e) {
       setErr(e.message);
     }
@@ -1090,7 +1090,7 @@ function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
-    // the cron poll only writes a new point every ~5 min, so there's nothing to gain polling faster
+    // new points land whenever anyone's page-view persists one, so a light poll is enough
     const id = setInterval(load, 60000);
     return () => clearInterval(id);
   }, [load]);
@@ -1103,7 +1103,7 @@ function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
     <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 8px", marginTop: 10 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 8px" }}>
         <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 600 }}>
-          Strike {strike} PCR <span style={{ color: T.muted, fontWeight: 400 }}>· every ~5 min</span>
+          Strike {strike} PCR <span style={{ color: T.muted, fontWeight: 400 }}>· builds through the day</span>
         </div>
         <button onClick={onClose} title="Close"
           style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontFamily: MONO, fontSize: 14, lineHeight: 1 }}>
