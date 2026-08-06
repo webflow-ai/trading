@@ -100,10 +100,9 @@ async def redis_cmd(*args):
         return r.json().get("result")
 
 
-async def push_pcr_snapshot(symbol: str, day: str, snap: dict):
+async def push_snapshot(key: str, snap: dict):
     if not (KV_URL and KV_TOKEN):
         return
-    key = f"pcr:{symbol}:{day}"
     try:
         await redis_cmd("RPUSH", key, json.dumps(snap))
         await redis_cmd("EXPIRE", key, PCR_HISTORY_TTL_SECONDS)
@@ -111,16 +110,31 @@ async def push_pcr_snapshot(symbol: str, day: str, snap: dict):
         print(f"redis push failed for {key}: {e}")
 
 
-async def get_pcr_history(symbol: str, day: str) -> list:
+async def get_history(key: str) -> list:
     if not (KV_URL and KV_TOKEN):
         return []
-    key = f"pcr:{symbol}:{day}"
     try:
         raw = await redis_cmd("LRANGE", key, 0, -1)
         return [json.loads(x) for x in (raw or [])]
     except Exception as e:
         print(f"redis history fetch failed for {key}: {e}")
         return []
+
+
+async def push_pcr_snapshot(symbol: str, day: str, snap: dict):
+    await push_snapshot(f"pcr:{symbol}:{day}", snap)
+
+
+async def get_pcr_history(symbol: str, day: str) -> list:
+    return await get_history(f"pcr:{symbol}:{day}")
+
+
+async def push_strike_pcr_snapshot(symbol: str, strike, day: str, snap: dict):
+    await push_snapshot(f"strikepcr:{symbol}:{strike}:{day}", snap)
+
+
+async def get_strike_pcr_history(symbol: str, strike, day: str) -> list:
+    return await get_history(f"strikepcr:{symbol}:{strike}:{day}")
 
 
 async def get_client() -> httpx.AsyncClient:
@@ -334,10 +348,16 @@ async def upstox_callback(code: str = Query(None), error: str = Query(None)):
         return f"<h3>Token exchange failed: {e}</h3>"
 
 
-async def fetch_and_record_pcr(symbol: str, now: dt.datetime) -> dict:
+async def fetch_and_record_pcr(symbol: str, now: dt.datetime, persist_strikes: bool = False) -> dict:
     """Fetch a fresh PCR reading, update the in-memory cache, and append it
     to the persistent Redis history (best-effort — a Redis outage shouldn't
-    break the live reading, just the history)."""
+    break the live reading, just the history).
+
+    persist_strikes also snapshots every individual strike's PCR from the
+    same NSE fetch (no extra request) — left off by default since /api/pcr/today
+    can be called every few seconds while a tab is open, and writing 10
+    strikes' worth of history that often would burn through Redis's free
+    tier fast. Only the 5-min cron poll turns this on."""
     expiry = await get_nearest_expiry(symbol)
     oc = await fetch_option_chain_for_expiry(symbol, expiry)
     pcr = compute_pcr(oc, target_expiry=expiry)
@@ -347,10 +367,25 @@ async def fetch_and_record_pcr(symbol: str, now: dt.datetime) -> dict:
         "putOi": pcr["putOi"], "callOi": pcr["callOi"],
     }
     pcr_cache[symbol] = cached
-    await push_pcr_snapshot(symbol, now.date().isoformat(), {
-        "t": now.strftime("%H:%M"), "pcrOi": pcr["pcrOi"], "pcrVol": pcr["pcrVol"],
+    day = now.date().isoformat()
+    t_label = now.strftime("%H:%M")
+    await push_pcr_snapshot(symbol, day, {
+        "t": t_label, "pcrOi": pcr["pcrOi"], "pcrVol": pcr["pcrVol"],
         "putOi": pcr["putOi"], "callOi": pcr["callOi"],
     })
+
+    if persist_strikes:
+        try:
+            chain = build_chain_rows(oc, target_expiry=expiry)
+            for row in chain["rows"]:
+                strike_key = int(round(row["strike"]))
+                strike_pcr = (row["peOi"] / row["ceOi"]) if row["ceOi"] else None
+                await push_strike_pcr_snapshot(symbol, strike_key, day, {
+                    "t": t_label, "pcr": strike_pcr, "ceOi": row["ceOi"], "peOi": row["peOi"],
+                })
+        except Exception as e:
+            print(f"per-strike pcr persist failed for {symbol}: {e}")
+
     return cached
 
 
@@ -388,15 +423,28 @@ async def pcr_history(symbol: str = Query("NIFTY")):
     return {"symbol": symbol, "date": day, "snapshots": snapshots}
 
 
+@app.get("/api/optionchain/history")
+async def optionchain_history(symbol: str = Query("NIFTY"), strike: float = Query(...)):
+    """A single strike's PCR (put OI / call OI) over the current trading
+    day, sampled every ~5 min by the cron poll below — only strikes that
+    were within the top-N-near-spot window at poll time have data."""
+    symbol = symbol.upper()
+    day = dt.datetime.now(IST).date().isoformat()
+    strike_key = int(round(strike))
+    snapshots = await get_strike_pcr_history(symbol, strike_key, day)
+    return {"symbol": symbol, "strike": strike_key, "date": day, "snapshots": snapshots}
+
+
 @app.get("/api/cron/poll")
 async def cron_poll():
-    """Vercel Cron target — keeps PCR history building even with nobody
-    actively viewing the page. See vercel.json's "crons" entry."""
+    """Vercel Cron target — keeps PCR (whole-chain and per-strike) history
+    building even with nobody actively viewing the page. See vercel.json's
+    "crons" entry."""
     now = dt.datetime.now(IST)
     results = {}
     for sym in SYMBOLS:
         try:
-            await fetch_and_record_pcr(sym, now)
+            await fetch_and_record_pcr(sym, now, persist_strikes=True)
             results[sym] = "ok"
         except Exception as e:
             results[sym] = f"failed: {e}"

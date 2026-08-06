@@ -1068,12 +1068,83 @@ function expiryLabel(exp) {
   return parts.length >= 2 ? `${parts[0]} ${parts[1]}` : exp;
 }
 
+/* ---------- per-strike PCR history chart ---------- */
+function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
+  const [snaps, setSnaps] = useState([]);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    if (!backendUrl || strike == null) return;
+    try {
+      const base = backendUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/optionchain/history?symbol=${symbol}&strike=${strike}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const rows = (json.snapshots || []).filter((s) => s.pcr != null);
+      setSnaps(rows);
+      setErr(rows.length ? "" : "No history recorded for this strike yet — persists every ~5 min");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }, [backendUrl, symbol, strike]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // the cron poll only writes a new point every ~5 min, so there's nothing to gain polling faster
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const vals = snaps.map((s) => s.pcr);
+  const yMin = vals.length ? Math.min(...vals, 0.9) - 0.1 : 0.5;
+  const yMax = vals.length ? Math.max(...vals, 1.1) + 0.1 : 1.5;
+
+  return (
+    <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 8px", marginTop: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 8px" }}>
+        <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 600 }}>
+          Strike {strike} PCR <span style={{ color: T.muted, fontWeight: 400 }}>· every ~5 min</span>
+        </div>
+        <button onClick={onClose} title="Close"
+          style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontFamily: MONO, fontSize: 14, lineHeight: 1 }}>
+          ✕
+        </button>
+      </div>
+      <div style={{ height: 160 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={snaps} margin={{ top: 4, right: 10, bottom: 4, left: -12 }}>
+            <CartesianGrid stroke={T.line} strokeDasharray="2 4" vertical={false} />
+            <ReferenceLine y={1} stroke={T.amber} strokeDasharray="4 4" strokeOpacity={0.6} />
+            <XAxis dataKey="t" tick={{ fill: T.muted, fontSize: 9, fontFamily: MONO }}
+              tickLine={false} axisLine={{ stroke: T.line }} minTickGap={30} />
+            <YAxis domain={[yMin, yMax]} tick={{ fill: T.muted, fontSize: 9, fontFamily: MONO }}
+              tickLine={false} axisLine={false} width={36} tickFormatter={(v) => v.toFixed(2)} />
+            <Tooltip content={({ active, payload }) => {
+              if (!active || !payload || !payload.length) return null;
+              const p = payload[0].payload;
+              return (
+                <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 8px", fontFamily: MONO, fontSize: 11 }}>
+                  <div style={{ color: T.muted }}>{p.t} IST</div>
+                  <div style={{ color: T.cyan, fontWeight: 600 }}>PCR {p.pcr.toFixed(2)}</div>
+                </div>
+              );
+            }} />
+            <Line type="monotone" dataKey="pcr" stroke={T.cyan} strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {err && <div style={{ fontFamily: MONO, fontSize: 10, color: T.call, padding: "6px 4px 0" }}>{err}</div>}
+    </div>
+  );
+}
+
 /* ---------- option chain: panel ---------- */
 function OptionChain({ backendUrl, symbol }) {
   const [chain, setChain] = useState(null);
   const [chainErr, setChainErr] = useState("");
   const [expiries, setExpiries] = useState([]);
   const [selectedExpiry, setSelectedExpiry] = useState("");
+  const [selectedStrike, setSelectedStrike] = useState(null);
 
   const loadExpiries = useCallback(async () => {
     if (!backendUrl) return;
@@ -1110,6 +1181,7 @@ function OptionChain({ backendUrl, symbol }) {
     setChain(null);
     setExpiries([]);
     setSelectedExpiry("");
+    setSelectedStrike(null);
     loadExpiries();
   }, [symbol, backendUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1181,10 +1253,12 @@ function OptionChain({ backendUrl, symbol }) {
                   <FlashCell value={r.ceOi} render={fmtOi} />
                   <FlashCell value={r.ceOiChg} render={(v) => `${v >= 0 ? "+" : ""}${fmtOi(v)}`} />
                   <FlashCell value={r.ceVol} render={fmtOi} />
-                  <td style={{
-                    padding: "6px 8px", textAlign: "center", fontFamily: MONO, fontSize: 12, fontWeight: 700,
-                    color: isAtm ? T.amber : T.fg,
-                  }}>
+                  <td onClick={() => setSelectedStrike((s) => (s === r.strike ? null : r.strike))}
+                    title="Click to chart this strike's PCR history"
+                    style={{
+                      padding: "6px 8px", textAlign: "center", fontFamily: MONO, fontSize: 12, fontWeight: 700,
+                      color: selectedStrike === r.strike ? T.cyan : isAtm ? T.amber : T.fg, cursor: "pointer",
+                    }}>
                     {r.strike}
                     {isAtm && <div style={{ fontSize: 9, fontWeight: 500, color: T.amber, letterSpacing: ".08em" }}>ATM</div>}
                   </td>
@@ -1204,6 +1278,14 @@ function OptionChain({ backendUrl, symbol }) {
         </table>
       </div>
       {chainErr && <div style={{ fontFamily: MONO, fontSize: 10, color: T.call, padding: "6px 8px 0" }}>{chainErr}</div>}
+      {!chainErr && !selectedStrike && (
+        <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted, textAlign: "center", padding: "6px 8px 0" }}>
+          click a strike to chart its PCR history
+        </div>
+      )}
+      {selectedStrike != null && (
+        <StrikePcrHistory backendUrl={backendUrl} symbol={symbol} strike={selectedStrike} onClose={() => setSelectedStrike(null)} />
+      )}
     </div>
   );
 }
