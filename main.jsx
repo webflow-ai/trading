@@ -1082,7 +1082,7 @@ function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
       const json = await res.json();
       const rows = (json.snapshots || []).filter((s) => s.pcr != null);
       setSnaps(rows);
-      setErr(rows.length ? "" : "No history recorded for this strike yet — builds up as the page is visited through the day");
+      setErr(rows.length ? "" : "No history recorded for this strike yet — the first visit of the day starts it, then a new point every ~5 min");
     } catch (e) {
       setErr(e.message);
     }
@@ -1098,17 +1098,38 @@ function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
   const vals = snaps.map((s) => s.pcr);
   const yMin = vals.length ? Math.min(...vals, 0.9) - 0.1 : 0.5;
   const yMax = vals.length ? Math.max(...vals, 1.1) + 0.1 : 1.5;
+  const last = snaps[snaps.length - 1];
+  const first = snaps[0];
+  const delta = last && first ? last.pcr - first.pcr : null;
 
   return (
     <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 8px", marginTop: 10 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 8px" }}>
-        <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 600 }}>
-          Strike {strike} PCR <span style={{ color: T.muted, fontWeight: 400 }}>· builds through the day</span>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 8px", flexWrap: "wrap", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: DISP, fontSize: 12, fontWeight: 600 }}>Strike {strike} PCR</span>
+          <span style={{
+            fontFamily: MONO, fontSize: 10, fontWeight: 700, color: T.cyan,
+            border: `1px solid ${T.cyan}44`, borderRadius: 999, padding: "2px 8px",
+          }}>
+            5m
+          </span>
         </div>
-        <button onClick={onClose} title="Close"
-          style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontFamily: MONO, fontSize: 14, lineHeight: 1 }}>
-          ✕
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {last && (
+            <span style={{ fontFamily: MONO, fontSize: 13, color: T.fg, fontWeight: 600 }}>
+              {last.pcr.toFixed(2)}
+              {delta != null && (
+                <span style={{ fontSize: 11, marginLeft: 6, color: delta >= 0 ? T.put : T.call }}>
+                  {delta >= 0 ? "▲" : "▼"} {Math.abs(delta).toFixed(2)}
+                </span>
+              )}
+            </span>
+          )}
+          <button onClick={onClose} title="Close"
+            style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontFamily: MONO, fontSize: 14, lineHeight: 1 }}>
+            ✕
+          </button>
+        </div>
       </div>
       <div style={{ height: 160 }}>
         <ResponsiveContainer width="100%" height="100%">

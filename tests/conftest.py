@@ -34,8 +34,8 @@ def clear_in_memory_caches():
 @pytest.fixture
 def fake_redis(monkeypatch):
     """An in-memory stand-in for Upstash's REST API, keyed the same way
-    (RPUSH/EXPIRE/LRANGE) — lets persistence logic be tested for real
-    without any network call."""
+    (RPUSH/EXPIRE/LRANGE/GET/SET) — lets persistence logic be tested for
+    real without any network call."""
     store: dict = {}
 
     async def fake_redis_cmd(*args):
@@ -49,6 +49,13 @@ def fake_redis(monkeypatch):
         if cmd == "LRANGE":
             key = args[1]
             return store.get(key, [])
+        if cmd == "SET":
+            key, value = args[1], args[2]
+            store[key] = value
+            return "OK"
+        if cmd == "GET":
+            key = args[1]
+            return store.get(key)
         return None
 
     monkeypatch.setattr(index_module, "redis_cmd", fake_redis_cmd)

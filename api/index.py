@@ -79,6 +79,7 @@ upstox_token: dict = {
 chain_store: dict = {}   # chain_store[symbol][expiry] = {"updatedAt", "spot", "rows"}
 pcr_cache: dict = {}     # pcr_cache[symbol] = {"updatedAt", "expiry", "pcrOi", "pcrVol", "putOi", "callOi"}
 expiry_cache: dict = {}  # expiry_cache[symbol] = {"date", "expiries"}
+STRIKE_PERSIST_INTERVAL_SECONDS = 5 * 60  # a real 5-min series, driven by visitor traffic — not cron
 
 _client: httpx.AsyncClient | None = None
 
@@ -135,6 +136,27 @@ async def push_strike_pcr_snapshot(symbol: str, strike, day: str, snap: dict):
 
 async def get_strike_pcr_history(symbol: str, strike, day: str) -> list:
     return await get_history(f"strikepcr:{symbol}:{strike}:{day}")
+
+
+async def claim_strike_persist_slot(symbol: str, day: str, now: dt.datetime) -> bool:
+    """True at most once per STRIKE_PERSIST_INTERVAL_SECONDS per symbol/day —
+    backed by Redis (not local memory) so the throttle holds across
+    serverless cold starts and concurrent instances, not just one process."""
+    if not (KV_URL and KV_TOKEN):
+        return False
+    key = f"strikepersist:{symbol}:{day}"
+    try:
+        last = await redis_cmd("GET", key)
+        if last:
+            age = (now - dt.datetime.fromisoformat(last)).total_seconds()
+            if age < STRIKE_PERSIST_INTERVAL_SECONDS:
+                return False
+        await redis_cmd("SET", key, now.isoformat())
+        await redis_cmd("EXPIRE", key, PCR_HISTORY_TTL_SECONDS)
+        return True
+    except Exception as e:
+        print(f"strike persist throttle check failed: {e}")
+        return False
 
 
 async def get_client() -> httpx.AsyncClient:
@@ -353,11 +375,11 @@ async def fetch_and_record_pcr(symbol: str, now: dt.datetime, persist_strikes: b
     to the persistent Redis history (best-effort — a Redis outage shouldn't
     break the live reading, just the history).
 
-    persist_strikes also snapshots every individual strike's PCR from the
-    same NSE fetch (no extra request) — left off by default since /api/pcr/today
-    can be called every few seconds while a tab is open, and writing 10
-    strikes' worth of history that often would burn through Redis's free
-    tier fast. Only the once-daily cron poll turns this on."""
+    persist_strikes additionally snapshots every individual strike's PCR
+    from the same NSE fetch (no extra request), through the same 5-min
+    Redis-backed throttle /api/optionchain/today uses — this is what the
+    once-daily cron sets, mainly as a gap-filler for days nobody visits;
+    real visitor traffic is the primary source of per-strike history now."""
     expiry = await get_nearest_expiry(symbol)
     oc = await fetch_option_chain_for_expiry(symbol, expiry)
     pcr = compute_pcr(oc, target_expiry=expiry)
@@ -374,7 +396,7 @@ async def fetch_and_record_pcr(symbol: str, now: dt.datetime, persist_strikes: b
         "putOi": pcr["putOi"], "callOi": pcr["callOi"],
     })
 
-    if persist_strikes:
+    if persist_strikes and await claim_strike_persist_slot(symbol, day, now):
         try:
             chain = build_chain_rows(oc, target_expiry=expiry)
             for row in chain["rows"]:
@@ -491,6 +513,28 @@ async def optionchain_today(symbol: str = Query("NIFTY"), n: int = Query(CHAIN_T
             print(f"[{now:%H:%M:%S}] {symbol} on-demand chain fetch failed ({expiry}): {e}")
             if cached is None:
                 cached = {"updatedAt": None, "spot": None, "rows": []}
+
+    # Per-strike PCR history is driven by real visitor traffic, not cron —
+    # this is what actually gives a proper ~5-min series starting from
+    # whenever the page is first opened each day. Throttled via Redis (not
+    # a plain "if stale" check) so it holds to ~5 min regardless of how
+    # often this endpoint gets polled. Only the nearest expiry is recorded,
+    # so browsing a later expiry doesn't mix into the same strike's history.
+    if cached.get("rows"):
+        try:
+            nearest = await get_nearest_expiry(symbol)
+            if expiry == nearest:
+                day = now.date().isoformat()
+                if await claim_strike_persist_slot(symbol, day, now):
+                    t_label = now.strftime("%H:%M")
+                    for row in cached["rows"]:
+                        strike_key = int(round(row["strike"]))
+                        strike_pcr = (row["peOi"] / row["ceOi"]) if row["ceOi"] else None
+                        await push_strike_pcr_snapshot(symbol, strike_key, day, {
+                            "t": t_label, "pcr": strike_pcr, "ceOi": row["ceOi"], "peOi": row["peOi"],
+                        })
+        except Exception as e:
+            print(f"per-strike pcr persist failed for {symbol}: {e}")
 
     return {
         "symbol": symbol,
