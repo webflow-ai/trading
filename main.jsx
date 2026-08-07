@@ -1159,6 +1159,124 @@ function StrikePcrHistory({ backendUrl, symbol, strike, onClose }) {
   );
 }
 
+/* ---------- PCR sheet: time x strike pivot table, 5-min intervals ---------- */
+function pcrCellColor(v) {
+  return v == null ? T.muted : v > 1.05 ? T.put : v < 0.95 ? T.call : T.amber;
+}
+
+function OptionChainSheet({ backendUrl, symbol, strikes, onClose }) {
+  const [data, setData] = useState({});
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    if (!backendUrl || !strikes.length) return;
+    try {
+      const base = backendUrl.replace(/\/$/, "");
+      const qs = new URLSearchParams({ symbol, strikes: strikes.join(",") });
+      const res = await fetch(`${base}/api/optionchain/history-sheet?${qs.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const strikesData = json.strikes || {};
+      setData(strikesData);
+      const anyPoints = Object.values(strikesData).some((rows) => rows && rows.length);
+      setErr(anyPoints ? "" : "No recorded history yet today — the first visit of the day starts it, then a new column every ~5 min");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }, [backendUrl, symbol, strikes]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const id = setInterval(load, 60000); // new columns land ~every 5 min; no benefit polling faster
+    return () => clearInterval(id);
+  }, [load]);
+
+  const times = useMemo(() => {
+    const set = new Set();
+    Object.values(data).forEach((rows) => (rows || []).forEach((r) => { if (r.pcr != null) set.add(r.t); }));
+    return Array.from(set).sort();
+  }, [data]);
+
+  const lookup = useMemo(() => {
+    const out = {};
+    Object.entries(data).forEach(([strike, rows]) => {
+      out[strike] = {};
+      (rows || []).forEach((r) => { if (r.pcr != null) out[strike][r.t] = r.pcr; });
+    });
+    return out;
+  }, [data]);
+
+  return (
+    <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: "12px 8px", marginTop: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 10px", flexWrap: "wrap", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: DISP, fontSize: 12, fontWeight: 600 }}>PCR Sheet</span>
+          <span style={{
+            fontFamily: MONO, fontSize: 10, fontWeight: 700, color: T.cyan,
+            border: `1px solid ${T.cyan}44`, borderRadius: 999, padding: "2px 8px",
+          }}>
+            5m
+          </span>
+          <span style={{ fontFamily: MONO, fontSize: 10, color: T.muted }}>time × strike</span>
+        </div>
+        <button onClick={onClose} title="Close"
+          style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontFamily: MONO, fontSize: 14, lineHeight: 1 }}>
+          ✕
+        </button>
+      </div>
+      <div style={{ overflow: "auto", maxHeight: 320 }}>
+        <table style={{ borderCollapse: "collapse", fontFamily: MONO, fontSize: 10, width: "100%" }}>
+          <thead>
+            <tr>
+              <th style={{
+                position: "sticky", left: 0, top: 0, zIndex: 2, background: T.panel,
+                padding: "5px 10px", textAlign: "left", color: T.muted, borderBottom: `1px solid ${T.line}`,
+              }}>
+                Time
+              </th>
+              {strikes.map((s) => (
+                <th key={s} style={{
+                  position: "sticky", top: 0, background: T.panel, padding: "5px 10px",
+                  textAlign: "right", color: T.muted, borderBottom: `1px solid ${T.line}`, whiteSpace: "nowrap",
+                }}>
+                  {s}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {times.map((t) => (
+              <tr key={t}>
+                <td style={{
+                  position: "sticky", left: 0, background: T.panel, padding: "4px 10px",
+                  color: T.muted, borderBottom: `1px solid ${T.line}22`, whiteSpace: "nowrap",
+                }}>
+                  {t}
+                </td>
+                {strikes.map((s) => {
+                  const v = lookup[s]?.[t];
+                  return (
+                    <td key={s} style={{
+                      padding: "4px 10px", textAlign: "right", fontWeight: 600,
+                      color: pcrCellColor(v), borderBottom: `1px solid ${T.line}22`,
+                    }}>
+                      {v == null ? "—" : v.toFixed(2)}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+            {!times.length && (
+              <tr><td colSpan={strikes.length + 1} style={{ padding: 16, textAlign: "center", color: T.muted }}>No recorded history yet today</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {err && <div style={{ fontFamily: MONO, fontSize: 10, color: T.call, padding: "8px 4px 0" }}>{err}</div>}
+    </div>
+  );
+}
+
 /* ---------- option chain: panel ---------- */
 function OptionChain({ backendUrl, symbol }) {
   const [chain, setChain] = useState(null);
@@ -1166,6 +1284,7 @@ function OptionChain({ backendUrl, symbol }) {
   const [expiries, setExpiries] = useState([]);
   const [selectedExpiry, setSelectedExpiry] = useState("");
   const [selectedStrike, setSelectedStrike] = useState(null);
+  const [showSheet, setShowSheet] = useState(false);
 
   const loadExpiries = useCallback(async () => {
     if (!backendUrl) return;
@@ -1229,6 +1348,14 @@ function OptionChain({ backendUrl, symbol }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: MONO, fontSize: 11 }}>
           {chain?.spot != null && <span style={{ color: T.muted }}>Spot {fmt(chain.spot, 2)}</span>}
           <Pill color={rows.length ? T.put : T.call} dot={!!rows.length}>{rows.length ? "Live" : "No data"}</Pill>
+          <button onClick={() => setShowSheet((s) => !s)} title="Show every strike's 5-min PCR history as a sheet"
+            style={{
+              padding: "4px 10px", borderRadius: 999, cursor: "pointer", fontSize: 11,
+              background: showSheet ? T.cyan : T.panel2, color: showSheet ? T.ink : T.muted,
+              border: `1px solid ${showSheet ? T.cyan : T.line}`,
+            }}>
+            Sheet
+          </button>
         </div>
       </div>
 
@@ -1320,6 +1447,9 @@ function OptionChain({ backendUrl, symbol }) {
       )}
       {selectedStrike != null && (
         <StrikePcrHistory backendUrl={backendUrl} symbol={symbol} strike={selectedStrike} onClose={() => setSelectedStrike(null)} />
+      )}
+      {showSheet && rows.length > 0 && (
+        <OptionChainSheet backendUrl={backendUrl} symbol={symbol} strikes={rows.map((r) => r.strike)} onClose={() => setShowSheet(false)} />
       )}
     </div>
   );

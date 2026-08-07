@@ -459,6 +459,29 @@ async def optionchain_history(symbol: str = Query("NIFTY"), strike: float = Quer
     return {"symbol": symbol, "strike": strike_key, "date": day, "snapshots": snapshots}
 
 
+@app.get("/api/optionchain/history-sheet")
+async def optionchain_history_sheet(symbol: str = Query("NIFTY"), strikes: str = Query(...)):
+    """Every-5-min PCR history for several strikes at once (comma-separated,
+    e.g. the currently-displayed option-chain rows) — powers the
+    spreadsheet-style time x strike view instead of one chart per strike."""
+    symbol = symbol.upper()
+    day = dt.datetime.now(IST).date().isoformat()
+    strike_keys = []
+    for raw in strikes.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            strike_keys.append(int(round(float(raw))))
+        except ValueError:
+            continue
+
+    result = {}
+    for strike_key in strike_keys:
+        result[str(strike_key)] = await get_strike_pcr_history(symbol, strike_key, day)
+    return {"symbol": symbol, "date": day, "strikes": result}
+
+
 @app.get("/api/cron/poll")
 async def cron_poll():
     """Vercel Cron target — runs once/day shortly after market open (Hobby

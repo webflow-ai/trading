@@ -155,3 +155,25 @@ def test_optionchain_today_skips_persist_for_non_nearest_expiry(monkeypatch, fak
 
     day = dt.datetime.now(IST).date().isoformat()
     assert f"strikepcr:NIFTY:24500:{day}" not in fake_redis
+
+
+def test_history_sheet_returns_per_strike_history_keyed_by_strike(fake_redis):
+    from api.index import push_strike_pcr_snapshot
+    day = dt.datetime.now(IST).date().isoformat()  # the endpoint keys off "today" internally, so match that
+    asyncio.run(push_strike_pcr_snapshot("NIFTY", 24400, day, {"t": "09:15", "pcr": 1.5}))
+    asyncio.run(push_strike_pcr_snapshot("NIFTY", 24400, day, {"t": "09:20", "pcr": 1.6}))
+    asyncio.run(push_strike_pcr_snapshot("NIFTY", 24450, day, {"t": "09:15", "pcr": 0.8}))
+
+    r = client.get("/api/optionchain/history-sheet", params={"symbol": "NIFTY", "strikes": "24400,24450,24500"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["strikes"]["24400"] == [{"t": "09:15", "pcr": 1.5}, {"t": "09:20", "pcr": 1.6}]
+    assert body["strikes"]["24450"] == [{"t": "09:15", "pcr": 0.8}]
+    assert body["strikes"]["24500"] == []  # requested but never recorded — empty, not an error
+
+
+def test_history_sheet_ignores_malformed_strike_values(fake_redis):
+    r = client.get("/api/optionchain/history-sheet", params={"symbol": "NIFTY", "strikes": "24400,not-a-number,,24450"})
+    assert r.status_code == 200
+    assert set(r.json()["strikes"].keys()) == {"24400", "24450"}
