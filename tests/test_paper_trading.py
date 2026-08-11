@@ -152,3 +152,34 @@ def test_summarize_ignores_closed_trades_missing_pnl():
     result = paper_trading.summarize(trades)
     assert result["closed_count"] == 1
     assert result["total_pnl"] == 100.0
+
+
+# ---------------- weekly_pnl ----------------
+# 2026-08-03 and 2026-08-10 are both Mondays (confirmed against the real
+# calendar elsewhere in this test suite) -- one week apart, used as the two
+# week-start anchors below.
+
+def test_weekly_pnl_groups_by_week_of_exit_time_newest_first():
+    trades = [
+        {"status": "closed", "pnl": 100.0, "exit_time": "2026-08-05T10:00:00+00:00"},  # Wed, week of 08-03
+        {"status": "closed", "pnl": -50.0, "exit_time": "2026-08-06T10:00:00+00:00"},  # Thu, week of 08-03
+        {"status": "closed", "pnl": 200.0, "exit_time": "2026-08-11T10:00:00+00:00"},  # Tue, week of 08-10
+    ]
+    weeks = paper_trading.weekly_pnl(trades)
+
+    assert [w["week_start"] for w in weeks] == ["2026-08-10", "2026-08-03"]
+    assert weeks[0] == {"week_start": "2026-08-10", "trades": 1, "wins": 1, "losses": 0, "total_pnl": 200.0}
+    assert weeks[1] == {"week_start": "2026-08-03", "trades": 2, "wins": 1, "losses": 1, "total_pnl": 50.0}
+
+
+def test_weekly_pnl_ignores_open_trades_and_missing_pnl():
+    trades = [
+        {"status": "open", "exit_time": None},
+        {"status": "closed", "pnl": None, "exit_time": "2026-08-05T10:00:00+00:00"},
+        {"status": "closed", "pnl": 100.0, "exit_time": None},
+    ]
+    assert paper_trading.weekly_pnl(trades) == []
+
+
+def test_weekly_pnl_empty_list():
+    assert paper_trading.weekly_pnl([]) == []

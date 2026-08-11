@@ -419,9 +419,63 @@ function formButtonStyle(primary, disabled) {
 const tradeThStyle = { padding: "6px 8px", fontWeight: 500, whiteSpace: "nowrap" };
 const tradeTdStyle = { padding: "6px 8px", color: T.fg, whiteSpace: "nowrap" };
 
+// Live mark-to-market for one open trade, from the option-chain lookup
+// built in load() below. Mirrors paper_trading.compute_pnl's sign
+// convention (BUY profits above entry, SELL below) but computed client-side
+// against a *current*, not final, premium -- unrealized, not stored.
+function liveFigures(trade, chainByStrike) {
+  const invested = trade.entry_price * trade.lot_size * trade.lots;
+  if (trade.status !== "open") {
+    return { invested, currentLtp: null, currentValue: null, pnl: trade.pnl, isLive: false };
+  }
+  const chainRow = chainByStrike[Number(trade.strike)];
+  const currentLtp = chainRow ? (trade.option_type === "CE" ? chainRow.ceLtp : chainRow.peLtp) : null;
+  if (currentLtp == null) {
+    return { invested, currentLtp: null, currentValue: null, pnl: null, isLive: false };
+  }
+  const direction = trade.action === "BUY" ? 1 : -1;
+  const pnl = (currentLtp - trade.entry_price) * direction * trade.lot_size * trade.lots;
+  return { invested, currentLtp, currentValue: currentLtp * trade.lot_size * trade.lots, pnl, isLive: true };
+}
+
+async function fetchChainMap() {
+  try {
+    const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
+    if (!res.ok) return {};
+    const json = await res.json();
+    const chain = {};
+    (json.rows || []).forEach((r) => { chain[Number(r.strike)] = r; });
+    return chain;
+  } catch {
+    return {}; // background tick -- not worth surfacing an error banner for
+  }
+}
+
+// Ticks its own clock every second (broker-platform-style live elapsed
+// time) — separate from the PnL itself, which can only update as fast as
+// the underlying premium data does (see the 5s poll below). A visible
+// second-by-second clock next to a slower-updating PnL is normal and
+// matches what real platforms show.
+function LiveElapsed({ since }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!since) return null;
+  const elapsedSec = Math.max(0, Math.floor((now - new Date(since).getTime()) / 1000));
+  const h = Math.floor(elapsedSec / 3600);
+  const m = Math.floor((elapsedSec % 3600) / 60);
+  const s = elapsedSec % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return <span style={{ fontFamily: MONO, fontSize: 10, color: T.cyan }}>{h > 0 ? `${h}h ` : ""}{pad(m)}:{pad(s)}</span>;
+}
+
 function PaperTradingPanel() {
   const [trades, setTrades] = useState([]);
   const [summary, setSummary] = useState(null);
+  const [weekly, setWeekly] = useState([]);
+  const [chainByStrike, setChainByStrike] = useState({});
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [form, setForm] = useState({
@@ -433,9 +487,11 @@ function PaperTradingPanel() {
 
   const load = useCallback(async () => {
     try {
-      const json = await getJSON("/paper-trades?days=90");
+      const [json, chain] = await Promise.all([getJSON("/paper-trades?days=90"), fetchChainMap()]);
       setTrades(json.trades || []);
       setSummary(json.summary || null);
+      setWeekly(json.weekly || []);
+      setChainByStrike(chain);
       setErr("");
     } catch (e) {
       setErr(e.message);
@@ -445,6 +501,31 @@ function PaperTradingPanel() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  const openTrades = trades.filter((t) => t.status === "open");
+
+  // Live PnL, broker-platform-style: re-pull just the option chain (not the
+  // whole trades list) every 5s while any trade is open, so unrealized PnL
+  // updates on its own without a manual refresh. 5s, not 1s, because the
+  // underlying NSE data itself is CDN-cached on ~10-15s cycles upstream
+  // (see backend.py) -- polling faster would just re-fetch the same
+  // numbers. Paused entirely once nothing is open, so it isn't running
+  // forever in a background tab for no reason.
+  useEffect(() => {
+    if (openTrades.length === 0) return;
+    const id = setInterval(async () => setChainByStrike(await fetchChainMap()), 5000);
+    return () => clearInterval(id);
+  }, [openTrades.length]);
+
+  const unrealizedTotal = openTrades.reduce((sum, t) => {
+    const { pnl, isLive } = liveFigures(t, chainByStrike);
+    return isLive ? sum + pnl : sum;
+  }, 0);
+  const investedTotal = openTrades.reduce((sum, t) => sum + liveFigures(t, chainByStrike).invested, 0);
+  const currentValueTotal = openTrades.reduce((sum, t) => {
+    const { currentValue, isLive } = liveFigures(t, chainByStrike);
+    return isLive ? sum + currentValue : sum;
+  }, 0);
 
   const fetchLivePremium = async () => {
     if (!form.strike) return;
@@ -522,10 +603,17 @@ function PaperTradingPanel() {
       right={summary && (
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <Chip color={T.muted}>{summary.open_count} open</Chip>
+          {openTrades.length > 0 && (
+            <>
+              <Chip color={T.muted}>Invested: {fmtNum(investedTotal, 0)}</Chip>
+              <Chip color={T.cyan}>Current value: {fmtNum(currentValueTotal, 0)}</Chip>
+              <Chip color={directionColor(unrealizedTotal)}>Unrealized: {fmtSigned(unrealizedTotal, 0)}</Chip>
+            </>
+          )}
           {summary.win_rate_pct != null && (
             <Chip color={summary.win_rate_pct >= 50 ? T.put : T.call}>Win rate: {summary.win_rate_pct}%</Chip>
           )}
-          <Chip color={directionColor(summary.total_pnl)}>Total PnL: {fmtSigned(summary.total_pnl, 0)}</Chip>
+          <Chip color={directionColor(summary.total_pnl)}>Realized PnL: {fmtSigned(summary.total_pnl, 0)}</Chip>
         </div>
       )}
     >
@@ -590,56 +678,111 @@ function PaperTradingPanel() {
           <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
             <thead>
               <tr style={{ color: T.muted, textAlign: "left" }}>
-                <th style={tradeThStyle}>Date</th>
+                <th style={tradeThStyle}>Entry time</th>
                 <th style={tradeThStyle}>Strike</th>
                 <th style={tradeThStyle}>Type</th>
                 <th style={tradeThStyle}>Action</th>
                 <th style={tradeThStyle}>Lots</th>
                 <th style={tradeThStyle}>Entry</th>
-                <th style={tradeThStyle}>Exit</th>
+                <th style={tradeThStyle}>Invested</th>
+                <th style={tradeThStyle}>LTP / Exit</th>
+                <th style={tradeThStyle}>Value</th>
                 <th style={tradeThStyle}>PnL</th>
                 <th style={tradeThStyle}>Status</th>
               </tr>
             </thead>
             <tbody>
-              {trades.map((t) => (
-                <tr key={t.id} style={{ borderTop: `1px solid ${T.line}` }}>
-                  <td style={tradeTdStyle}>{t.trade_date}</td>
-                  <td style={tradeTdStyle}>{fmtNum(t.strike, 0)}</td>
-                  <td style={tradeTdStyle}>{t.option_type}</td>
-                  <td style={tradeTdStyle}>{t.action}</td>
-                  <td style={tradeTdStyle}>{t.lots}</td>
-                  <td style={tradeTdStyle}>{fmtNum(t.entry_price, 2)}</td>
-                  <td style={tradeTdStyle}>{t.exit_price != null ? fmtNum(t.exit_price, 2) : "—"}</td>
-                  <td style={{ ...tradeTdStyle, color: t.pnl != null ? directionColor(t.pnl) : T.muted, fontWeight: 700 }}>
-                    {t.pnl != null ? fmtSigned(t.pnl, 0) : "—"}
-                  </td>
-                  <td style={tradeTdStyle}>
-                    {t.status === "open" ? (
-                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                        <input type="number" step="0.05" placeholder="exit premium" value={closingDrafts[t.id] || ""}
-                          onChange={(e) => setClosingDrafts((c) => ({ ...c, [t.id]: e.target.value }))}
-                          style={{ ...formInputStyle, width: 90 }} />
-                        <button onClick={() => submitClose(t.id)} disabled={!closingDrafts[t.id]}
-                          style={formButtonStyle(false, !closingDrafts[t.id])}>
-                          Close
-                        </button>
+              {trades.map((t) => {
+                const { invested, currentLtp, currentValue, pnl, isLive } = liveFigures(t, chainByStrike);
+                const isOpen = t.status === "open";
+                return (
+                  <tr key={t.id} style={{ borderTop: `1px solid ${T.line}` }}>
+                    <td style={tradeTdStyle}>
+                      <div>{t.trade_date}</div>
+                      <div style={{ color: T.muted, fontSize: 10 }}>
+                        {t.entry_time ? new Date(t.entry_time).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"} IST
                       </div>
-                    ) : (
-                      <Chip color={T.muted}>closed</Chip>
-                    )}
-                  </td>
-                </tr>
-              ))}
+                      {isOpen && <LiveElapsed since={t.entry_time} />}
+                    </td>
+                    <td style={tradeTdStyle}>{fmtNum(t.strike, 0)}</td>
+                    <td style={tradeTdStyle}>{t.option_type}</td>
+                    <td style={tradeTdStyle}>{t.action}</td>
+                    <td style={tradeTdStyle}>{t.lots}</td>
+                    <td style={tradeTdStyle}>{fmtNum(t.entry_price, 2)}</td>
+                    <td style={tradeTdStyle}>{fmtNum(invested, 0)}</td>
+                    <td style={tradeTdStyle}>
+                      {isOpen
+                        ? (currentLtp != null ? <>{fmtNum(currentLtp, 2)} <span style={{ color: T.cyan, fontSize: 10 }}>live</span></> : "—")
+                        : (t.exit_price != null ? fmtNum(t.exit_price, 2) : "—")}
+                    </td>
+                    <td style={tradeTdStyle}>{currentValue != null ? fmtNum(currentValue, 0) : (isOpen ? "—" : fmtNum(invested + (t.pnl || 0), 0))}</td>
+                    <td style={{ ...tradeTdStyle, color: pnl != null ? directionColor(pnl) : T.muted, fontWeight: 700 }}>
+                      {pnl != null ? fmtSigned(pnl, 0) : "—"}
+                      {isOpen && isLive && <span style={{ color: T.muted, fontWeight: 400, fontSize: 10 }}> live</span>}
+                    </td>
+                    <td style={tradeTdStyle}>
+                      {isOpen ? (
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <input type="number" step="0.05" placeholder="exit premium" value={closingDrafts[t.id] || ""}
+                            onChange={(e) => setClosingDrafts((c) => ({ ...c, [t.id]: e.target.value }))}
+                            style={{ ...formInputStyle, width: 90 }} />
+                          <button onClick={() => submitClose(t.id)} disabled={!closingDrafts[t.id]}
+                            style={formButtonStyle(false, !closingDrafts[t.id])}>
+                            Close
+                          </button>
+                        </div>
+                      ) : (
+                        <Chip color={T.muted}>closed</Chip>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
       )}
+
+      {weekly.length > 0 && (
+        <>
+          <div style={{ height: 16 }} />
+          <div style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>
+            Weekly PnL
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+              <thead>
+                <tr style={{ color: T.muted, textAlign: "left" }}>
+                  <th style={tradeThStyle}>Week of</th>
+                  <th style={tradeThStyle}>Trades</th>
+                  <th style={tradeThStyle}>Won</th>
+                  <th style={tradeThStyle}>Lost</th>
+                  <th style={tradeThStyle}>PnL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {weekly.map((w) => (
+                  <tr key={w.week_start} style={{ borderTop: `1px solid ${T.line}` }}>
+                    <td style={tradeTdStyle}>{w.week_start}</td>
+                    <td style={tradeTdStyle}>{w.trades}</td>
+                    <td style={{ ...tradeTdStyle, color: T.put }}>{w.wins}</td>
+                    <td style={{ ...tradeTdStyle, color: T.call }}>{w.losses}</td>
+                    <td style={{ ...tradeTdStyle, color: directionColor(w.total_pnl), fontWeight: 700 }}>{fmtSigned(w.total_pnl, 0)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
       <div style={{ height: 8 }} />
       <EmptyNote>
         Simulated trades only — nothing here places a real order. Entry/exit premiums are either typed in or pulled
         from the existing PCR tracker's live option chain (not every strike may be available there); lot size
         defaults to a guess and should be confirmed against NSE's current contract spec before trusting PnL figures.
+        Live PnL on open trades refreshes every 5s from that same source — as fast as NSE's own data actually
+        updates, not faster.
       </EmptyNote>
     </Panel>
   );

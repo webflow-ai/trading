@@ -167,7 +167,11 @@ async def close_paper_trade_endpoint(trade_id: int, payload: dict):
 @app.get("/api/premarket/paper-trades")
 async def list_paper_trades_endpoint(status: str | None = Query(None), days: int = Query(90)):
     trades = await storage.get_paper_trades(status=status, days=days)
-    return {"trades": trades, "summary": paper_trading.summarize(trades)}
+    return {
+        "trades": trades,
+        "summary": paper_trading.summarize(trades),
+        "weekly": paper_trading.weekly_pnl(trades),
+    }
 
 
 @app.get("/api/premarket/health")

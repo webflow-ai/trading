@@ -86,3 +86,25 @@ def summarize(trades: list[dict]) -> dict:
         "total_pnl": total_pnl,
         "avg_pnl": round(total_pnl / len(closed), 2) if closed else None,
     }
+
+
+def weekly_pnl(trades: list[dict]) -> list[dict]:
+    """Realized PnL grouped by the Mon-Sun IST week each trade was *closed*
+    in (not opened — a trade's PnL isn't realized until exit), newest week
+    first. Only closed trades with a pnl and exit_time contribute; open
+    trades have no realized PnL yet (see the live unrealized figure the
+    dashboard computes separately, client-side, off current premiums)."""
+    closed = [t for t in trades if t.get("status") == "closed" and t.get("pnl") is not None and t.get("exit_time")]
+    buckets: dict[tuple, dict] = {}
+    for t in closed:
+        exit_dt = dt.datetime.fromisoformat(t["exit_time"].replace("Z", "+00:00")).astimezone(IST)
+        key = exit_dt.isocalendar()[:2]  # (iso_year, iso_week)
+        week_start = (exit_dt.date() - dt.timedelta(days=exit_dt.weekday())).isoformat()
+        bucket = buckets.setdefault(key, {"week_start": week_start, "trades": 0, "wins": 0, "losses": 0, "total_pnl": 0.0})
+        bucket["trades"] += 1
+        bucket["total_pnl"] += t["pnl"]
+        bucket["wins" if t["pnl"] > 0 else "losses"] += 1
+    weeks = sorted(buckets.values(), key=lambda b: b["week_start"], reverse=True)
+    for w in weeks:
+        w["total_pnl"] = round(w["total_pnl"], 2)
+    return weeks

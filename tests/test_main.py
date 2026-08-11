@@ -203,3 +203,4 @@ def test_list_paper_trades_endpoint_returns_trades_and_summary(monkeypatch):
     assert len(body["trades"]) == 2
     assert body["summary"]["total_pnl"] == 500.0
     assert body["summary"]["open_count"] == 1
+    assert body["weekly"] == []  # fake trades have no exit_time to group by
