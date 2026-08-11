@@ -235,6 +235,15 @@ function MacroPanel({ brief }) {
 }
 
 /* ---------- positioning ---------- */
+// An auto-fit Y domain makes even a genuinely "flat" move (below the
+// server's own TREND_FLAT_THRESHOLD_PCT_POINTS, currently 1pt — see
+// positioning.py) render as a dramatic full-height plunge, since Recharts
+// stretches whatever range it's given to fill the chart height. That's
+// misleading right next to a "Trend: flat" chip. Padding the domain to a
+// floor keeps small real-world noise visually flat; a move big enough to
+// actually matter still shows a real slope.
+const SPARKLINE_MIN_SPAN_PCT_POINTS = 10;
+
 function FiiSparkline({ rows }) {
   const data = useMemo(() => {
     return rows
@@ -246,6 +255,15 @@ function FiiSparkline({ rows }) {
       .sort((a, b) => (a.date < b.date ? -1 : 1));
   }, [rows]);
 
+  const domain = useMemo(() => {
+    if (data.length === 0) return [0, 100];
+    const values = data.map((d) => d.ratio);
+    const dataMin = Math.min(...values), dataMax = Math.max(...values);
+    const center = (dataMin + dataMax) / 2;
+    const halfSpan = Math.max((dataMax - dataMin) / 2, SPARKLINE_MIN_SPAN_PCT_POINTS / 2);
+    return [Math.max(0, center - halfSpan), Math.min(100, center + halfSpan)];
+  }, [data]);
+
   if (data.length < 2) return <EmptyNote>Not enough participant OI history yet for a trend line.</EmptyNote>;
   const last = data[data.length - 1];
 
@@ -255,7 +273,7 @@ function FiiSparkline({ rows }) {
         <LineChart data={data} margin={{ top: 6, right: 6, bottom: 0, left: 6 }}>
           <CartesianGrid stroke={T.line} strokeDasharray="3 3" vertical={false} />
           <XAxis dataKey="date" hide />
-          <YAxis domain={["auto", "auto"]} hide />
+          <YAxis domain={domain} hide />
           <Tooltip
             contentStyle={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, fontFamily: MONO, fontSize: 12 }}
             labelStyle={{ color: T.muted }}
