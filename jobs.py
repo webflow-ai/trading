@@ -88,6 +88,14 @@ async def _fetch_quotes(client: httpx.AsyncClient, symbols: dict[str, str]) -> d
     return dict(zip(names, results))
 
 
+async def _get_news_safely() -> dict:
+    try:
+        return await news_ai.get_news_brief()
+    except Exception as e:
+        print(f"jobs: news_ai.get_news_brief failed: {e}")
+        return {"headlines": [], "news_sentiment": None}
+
+
 async def run_morning_job(is_event_day: bool = False) -> dict:
     """Live pre-market cues + scoring: GIFT Nifty, US close, Asia live,
     macro, previous-day levels/structure, FII positioning, option snapshot
@@ -105,6 +113,13 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
     """
     today = dt.datetime.now(IST).date()
     t0 = time.monotonic()
+
+    # Gemini classification alone runs ~15-18s (live-measured) -- far longer
+    # than everything else in this function combined. It doesn't depend on
+    # any of the quotes/positioning below, so it's kicked off as a
+    # background task immediately and only awaited right before it's needed,
+    # letting it overlap with the rest of the job instead of adding on top.
+    news_task = asyncio.create_task(_get_news_safely())
 
     async with httpx.AsyncClient(timeout=15) as client:
         gift, us_quotes, asia_quotes, macro_quotes, levels, structure = await asyncio.gather(
@@ -165,12 +180,8 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
     )
 
     t4 = time.monotonic()
-    try:
-        news = await news_ai.get_news_brief()
-    except Exception as e:
-        print(f"jobs: news_ai.get_news_brief failed: {e}")
-        news = {"headlines": [], "news_sentiment": None}
-    print(f"jobs: morning news_ai.get_news_brief took {time.monotonic() - t4:.2f}s")
+    news = await news_task
+    print(f"jobs: morning news_task wait (already running in background) took {time.monotonic() - t4:.2f}s")
 
     brief = {
         "trade_date": today.isoformat(),

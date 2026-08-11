@@ -65,10 +65,18 @@ RSS_FEEDS = {
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 HEADLINE_WINDOW_HOURS = 12
-MAX_HEADLINES = 25
+# Verified live 2026-08-11: classify_headlines (one Gemini call, all fetched
+# headlines at once) was the actual bottleneck behind the 20s+ response
+# times, not the RSS/network calls -- 17.5s of a 21s total, live-measured.
+# Generation time scales with output volume, and only TOP_NEWS_COUNT of
+# these are ever shown, so asking Gemini to fully classify+reason about 25
+# headlines to keep 4 was mostly wasted output. Cut to 12 (still several
+# hours of real headline volume across 3 feeds) plus a shorter per-item
+# reason below -- the two together are what actually bring this down.
+MAX_HEADLINES = 12
 
 # How many headlines actually get shown/stored on the brief, out of the up-
-# to-25 fetched — the fetch casts a wide net, but a dashboard user wants the
+# to-12 fetched — the fetch casts a wide net, but a dashboard user wants the
 # handful that could actually move the market, not a full RSS dump.
 TOP_NEWS_COUNT = 4
 IMPACT_RANK = {"high": 3, "medium": 2, "low": 1}
@@ -78,7 +86,7 @@ For each headline below, classify its likely near-term impact on the Nifty index
 exactly one of: bullish, bearish, neutral, AND how large that impact is likely to be
 (high, medium, low — most headlines are low; reserve "high" for genuinely
 market-moving news like a rate decision, a major geopolitical shock, or a shift in
-FII flows, not routine single-stock earnings). Give a one-line reason for each.
+FII flows, not routine single-stock earnings). Give a reason for each in 8 words or fewer.
 Then give one overall one-line sentiment summary across all headlines for this morning.
 
 Respond with ONLY valid JSON, no markdown code fences, in exactly this shape:
@@ -231,7 +239,14 @@ async def classify_headlines(headlines: list[str], client: httpx.AsyncClient | N
         resp = await client.post(
             GEMINI_API_URL.format(model=GEMINI_MODEL),
             params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": _build_prompt(headlines)}]}]},
+            json={
+                "contents": [{"parts": [{"text": _build_prompt(headlines)}]}],
+                # Hard cap regardless of prompt compliance -- 12 headlines x a
+                # short reason each comfortably fits well under this; it's a
+                # backstop against a runaway response, not the primary fix
+                # (that's MAX_HEADLINES above).
+                "generationConfig": {"maxOutputTokens": 1024},
+            },
         )
         resp.raise_for_status()
         data = resp.json()
