@@ -239,25 +239,15 @@ async def classify_headlines(headlines: list[str], client: httpx.AsyncClient | N
         resp = await client.post(
             GEMINI_API_URL.format(model=GEMINI_MODEL),
             params={"key": GEMINI_API_KEY},
-            json={
-                "contents": [{"parts": [{"text": _build_prompt(headlines)}]}],
-                "generationConfig": {
-                    # Verified live 2026-08-11: a 1024 cap here made things
-                    # *worse* than uncapped, not better -- recent Gemini
-                    # models spend part of their token budget on hidden
-                    # "thinking" tokens before the visible answer, and 1024
-                    # was consumed by that alone, leaving an empty/truncated
-                    # response that failed to parse as JSON. That thinking
-                    # step is also almost certainly what the original
-                    # 17.5s-per-call latency was actually going to.
-                    # thinkingBudget: 0 turns it off outright (supported on
-                    # 2.x+ Flash models); maxOutputTokens is raised back up
-                    # as a generous backstop now that it isn't fighting the
-                    # thinking budget for room.
-                    "maxOutputTokens": 4096,
-                    "thinkingConfig": {"thinkingBudget": 0},
-                },
-            },
+            json={"contents": [{"parts": [{"text": _build_prompt(headlines)}]}]},
+            # No generationConfig, deliberately, after two failed live
+            # attempts at one (both 2026-08-11): maxOutputTokens: 1024 got
+            # silently consumed by this model's hidden "thinking" tokens
+            # before any visible JSON was produced (truncated, unparseable
+            # response); thinkingConfig.thinkingBudget: 0 to turn thinking
+            # off outright isn't a supported field on this model/API version
+            # at all (flat 400 Bad Request). MAX_HEADLINES above is the only
+            # verified-safe lever for cutting this call's latency.
         )
         resp.raise_for_status()
         data = resp.json()
