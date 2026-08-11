@@ -23,6 +23,13 @@ module depends on is now fully deprecated upstream ("All support ... has
 ended ... switch to the `google.genai` package" — printed as a
 FutureWarning on every import). It still works as of the test above, but a
 migration to `google-genai` is a real, not-yet-scheduled follow-up.
+
+Verified live 2026-08-11 (again): reuters_business 301-redirected
+www.reutersagency.com -> reutersagency.com (no www), which the shared
+client wasn't following, so that source silently contributed zero
+headlines every run. Fixed to the redirect target directly, and the client
+now follows redirects generally so a future host-name change like this
+degrades gracefully instead of dropping the source outright.
 """
 
 import asyncio
@@ -38,7 +45,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
 RSS_FEEDS = {
-    "reuters_business": "https://www.reutersagency.com/feed/?best-topics=business-finance",
+    "reuters_business": "https://reutersagency.com/feed/?best-topics=business-finance",
     "moneycontrol": "https://www.moneycontrol.com/rss/marketreports.xml",
     "et_markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
 }
@@ -135,7 +142,7 @@ async def fetch_all_headlines(now: dt.datetime | None = None) -> list[dict]:
     deduplicated, newest first, capped at MAX_HEADLINES. One dead feed never
     blocks the others — see fetch_rss_headlines."""
     now = now or dt.datetime.now(dt.timezone.utc)
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         groups = await asyncio.gather(
             *(fetch_rss_headlines(client, url, source) for source, url in RSS_FEEDS.items())
         )

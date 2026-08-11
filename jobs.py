@@ -18,6 +18,7 @@ be redundant work with no upside, so they're computed once, at the point
 they're actually consumed by scoring.
 """
 
+import asyncio
 import datetime as dt
 
 import httpx
@@ -80,21 +81,38 @@ async def run_evening_job(today: dt.date | None = None) -> dict:
     return result
 
 
+async def _fetch_quotes(client: httpx.AsyncClient, symbols: dict[str, str]) -> dict:
+    names = list(symbols.keys())
+    results = await asyncio.gather(*(market_data.fetch_quote(client, sym) for sym in symbols.values()))
+    return dict(zip(names, results))
+
+
 async def run_morning_job(is_event_day: bool = False) -> dict:
     """Live pre-market cues + scoring: GIFT Nifty, US close, Asia live,
     macro, previous-day levels/structure, FII positioning, option snapshot
     -> weighted score -> persisted morning_briefs row. Every source is
     fetched independently; a dead one is dropped from the score rather than
-    aborting the job (see scoring.compute_score)."""
+    aborting the job (see scoring.compute_score).
+
+    All the Yahoo/GIFT reads below are independent of each other and were
+    originally awaited one at a time (~14 sequential HTTP round trips) —
+    live-measured at 21+ seconds end to end, which put the whole request at
+    real risk of hitting Vercel's function timeout (and did, intermittently,
+    with a bare 500). Fetching them concurrently via asyncio.gather cuts
+    total latency to roughly the slowest single call instead of the sum of
+    all of them.
+    """
     today = dt.datetime.now(IST).date()
 
     async with httpx.AsyncClient(timeout=15) as client:
-        gift = await market_data.fetch_gift_nifty(client)
-        us_quotes = {name: await market_data.fetch_quote(client, sym) for name, sym in US_SYMBOLS.items()}
-        asia_quotes = {name: await market_data.fetch_quote(client, sym) for name, sym in ASIA_SYMBOLS.items()}
-        macro_quotes = {name: await market_data.fetch_quote(client, sym) for name, sym in MACRO_SYMBOLS.items()}
-        levels = await technicals.compute_levels(client)
-        structure = await technicals.compute_structure(client)
+        gift, us_quotes, asia_quotes, macro_quotes, levels, structure = await asyncio.gather(
+            market_data.fetch_gift_nifty(client),
+            _fetch_quotes(client, US_SYMBOLS),
+            _fetch_quotes(client, ASIA_SYMBOLS),
+            _fetch_quotes(client, MACRO_SYMBOLS),
+            technicals.compute_levels(client),
+            technicals.compute_structure(client),
+        )
 
     await storage.save_macro_snapshots(
         "morning",
@@ -102,10 +120,12 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
          **{k: v for k, v in macro_quotes.items() if v}},
     )
 
-    fii = await positioning.compute_fii_positioning()
-    option_snap = await positioning.option_snapshot("NIFTY")
-    participants = await positioning.participant_snapshot()
-    fii_dii_cash = await positioning.fii_dii_cash_snapshot()
+    fii, option_snap, participants, fii_dii_cash = await asyncio.gather(
+        positioning.compute_fii_positioning(),
+        positioning.option_snapshot("NIFTY"),
+        positioning.participant_snapshot(),
+        positioning.fii_dii_cash_snapshot(),
+    )
 
     crude = macro_quotes.get("crude")
     usdinr = macro_quotes.get("usdinr")
