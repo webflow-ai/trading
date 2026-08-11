@@ -153,6 +153,20 @@ def test_classify_headlines_falls_back_to_neutral_when_gemini_call_fails(monkeyp
     assert result["items"][0]["sentiment"] == "neutral"
 
 
+def test_classify_headlines_falls_back_when_response_has_no_visible_text(monkeypatch):
+    # A response cut short before producing any output (e.g. finishReason
+    # MAX_TOKENS with the budget spent entirely on hidden thinking tokens)
+    # has candidates but no usable content/parts.
+    monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
+    gemini_json = {"candidates": [{"finishReason": "MAX_TOKENS"}]}
+    client = FakeAsyncClient(response=FakeResponse(json_data=gemini_json))
+
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
+
+    assert "MAX_TOKENS" in result["note"]
+    assert result["items"][0]["sentiment"] == "neutral"
+
+
 def test_classify_headlines_returns_parsed_result_on_success(monkeypatch):
     monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
     gemini_json = {
