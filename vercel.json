@@ -1,12 +1,18 @@
 {
   "builds": [
     { "src": "api/index.py", "use": "@vercel/python" },
+    { "src": "api/premarket.py", "use": "@vercel/python" },
     { "src": "index.html", "use": "@vercel/static" },
-    { "src": "main.jsx", "use": "@vercel/static" }
+    { "src": "main.jsx", "use": "@vercel/static" },
+    { "src": "premarket.html", "use": "@vercel/static" },
+    { "src": "premarket.jsx", "use": "@vercel/static" }
   ],
   "routes": [
+    { "src": "/api/premarket/(.*)", "dest": "/api/premarket.py" },
     { "src": "/api/(.*)", "dest": "/api/index.py" },
     { "src": "/main.jsx", "dest": "/main.jsx" },
+    { "src": "/premarket.jsx", "dest": "/premarket.jsx" },
+    { "src": "/premarket.html", "dest": "/premarket.html" },
     { "src": "/", "dest": "/index.html" },
     { "src": "/(.*)", "dest": "/$1" }
   ],

@@ -1,0 +1,38 @@
+name: Nifty Pre-Market Engine jobs
+
+# External cron for the evening/morning jobs (docs/PREMARKET_ENGINE.md, Open
+# Decision 1) — this repo deploys to Vercel, whose Hobby-plan cron limits
+# already forced the existing PCR poller down to once/day, so the engine's
+# two daily triggers live here instead of in vercel.json.
+#
+# Requires, in this repo's GitHub Actions settings:
+#   - Variable  PREMARKET_BASE_URL   e.g. https://<your-project>.vercel.app
+#   - Secret    PREMARKET_JOB_API_KEY  same value as the Vercel env var of
+#                                       the same name (main.py checks it)
+#
+# Cron times are UTC. 19:30 IST = 14:00 UTC (evening job), 08:15 IST =
+# 02:45 UTC (morning job) — IST is a fixed UTC+5:30 offset with no DST, so
+# these never need seasonal adjustment.
+on:
+  schedule:
+    - cron: "0 14 * * 1-5"   # 7:30pm IST, Mon-Fri
+    - cron: "45 2 * * 1-5"   # 8:15am IST, Mon-Fri
+  workflow_dispatch: {}       # manual trigger for testing
+
+jobs:
+  run-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger evening job
+        if: github.event.schedule == '0 14 * * 1-5' || github.event_name == 'workflow_dispatch'
+        run: |
+          curl --fail --silent --show-error -X POST \
+            "${{ vars.PREMARKET_BASE_URL }}/api/premarket/jobs/evening" \
+            -H "X-API-Key: ${{ secrets.PREMARKET_JOB_API_KEY }}"
+
+      - name: Trigger morning job
+        if: github.event.schedule == '45 2 * * 1-5' || github.event_name == 'workflow_dispatch'
+        run: |
+          curl --fail --silent --show-error -X POST \
+            "${{ vars.PREMARKET_BASE_URL }}/api/premarket/jobs/morning" \
+            -H "X-API-Key: ${{ secrets.PREMARKET_JOB_API_KEY }}"

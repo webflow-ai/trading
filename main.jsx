@@ -1607,6 +1607,10 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <Pill color={status.open ? T.put : T.muted} dot={status.open}>{status.label}</Pill>
+            <a href="./premarket.html"
+              style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, textDecoration: "none" }}>
+              Pre-Market Brief →
+            </a>
             <button onClick={() => { setShowCfg((s) => !s); setUrlDraft(backendUrl); }}
               style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, cursor: "pointer" }}>
               ⚙ Source

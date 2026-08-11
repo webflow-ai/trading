@@ -1,3 +1,5 @@
 fastapi
 httpx
 python-dotenv
+pandas
+google-generativeai

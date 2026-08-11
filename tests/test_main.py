@@ -1,0 +1,124 @@
+import datetime as dt
+
+from fastapi.testclient import TestClient
+
+import main as main_module
+from main import app
+
+client = TestClient(app)
+
+
+def test_health_ok():
+    r = client.get("/api/premarket/health")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_jobs_endpoints_require_api_key(monkeypatch):
+    monkeypatch.setattr(main_module, "JOB_API_KEY", "secret123")
+    r = client.post("/api/premarket/jobs/evening")
+    assert r.status_code == 401
+
+
+def test_jobs_endpoints_500_when_server_has_no_key_configured(monkeypatch):
+    monkeypatch.setattr(main_module, "JOB_API_KEY", None)
+    r = client.post("/api/premarket/jobs/evening", headers={"X-API-Key": "anything"})
+    assert r.status_code == 500
+
+
+def test_evening_job_runs_with_correct_api_key(monkeypatch):
+    monkeypatch.setattr(main_module, "JOB_API_KEY", "secret123")
+
+    async def fake_run_evening_job():
+        return {"trade_date": "2026-08-10", "sources": {}}
+
+    monkeypatch.setattr(main_module.jobs, "run_evening_job", fake_run_evening_job)
+
+    r = client.post("/api/premarket/jobs/evening", headers={"X-API-Key": "secret123"})
+    assert r.status_code == 200
+    assert r.json()["trade_date"] == "2026-08-10"
+
+
+def test_morning_job_passes_through_event_day_flag(monkeypatch):
+    monkeypatch.setattr(main_module, "JOB_API_KEY", "secret123")
+    captured = {}
+
+    async def fake_run_morning_job(is_event_day=False):
+        captured["is_event_day"] = is_event_day
+        return {"trade_date": "2026-08-10", "score": 0, "verdict": "Flat open"}
+
+    monkeypatch.setattr(main_module.jobs, "run_morning_job", fake_run_morning_job)
+
+    r = client.post("/api/premarket/jobs/morning", params={"is_event_day": "true"},
+                     headers={"X-API-Key": "secret123"})
+    assert r.status_code == 200
+    assert captured["is_event_day"] is True
+
+
+def test_brief_today_returns_placeholder_when_nothing_generated_yet(monkeypatch):
+    async def fake_get_brief_history(days=1):
+        return []
+
+    monkeypatch.setattr(main_module.storage, "get_brief_history", fake_get_brief_history)
+
+    r = client.get("/api/premarket/brief/today")
+    assert r.status_code == 200
+    assert r.json()["note"] == "no brief generated yet"
+
+
+def test_brief_today_returns_latest_row(monkeypatch):
+    async def fake_get_brief_history(days=1):
+        return [{"trade_date": "2026-08-10", "score": 40.0, "verdict": "Gap-up likely"}]
+
+    monkeypatch.setattr(main_module.storage, "get_brief_history", fake_get_brief_history)
+
+    r = client.get("/api/premarket/brief/today")
+    assert r.status_code == 200
+    assert r.json()["verdict"] == "Gap-up likely"
+
+
+def test_classify_direction_dead_zone_and_signs():
+    assert main_module._classify_direction(100.0, 100.05) == "flat"  # +0.05%, within the dead zone
+    assert main_module._classify_direction(100.0, 100.5) == "up"
+    assert main_module._classify_direction(100.0, 99.5) == "down"
+    assert main_module._classify_direction(None, 100.0) is None
+
+
+def test_verdict_direction_maps_all_three_verdicts():
+    assert main_module._verdict_direction("Gap-up likely") == "up"
+    assert main_module._verdict_direction("Gap-down likely") == "down"
+    assert main_module._verdict_direction("Flat open") == "flat"
+    assert main_module._verdict_direction("something else") is None
+
+
+def test_brief_history_computes_hit_rate_against_actual_next_day_open(monkeypatch):
+    async def fake_get_brief_history(days=30):
+        return [
+            {"trade_date": "2026-08-06", "verdict": "Gap-up likely", "components": {"previous_close": 24500}},
+            {"trade_date": "2026-08-07", "verdict": "Gap-down likely", "components": {"previous_close": 24500}},
+        ]
+
+    async def fake_actual_open_after(trade_date, client):
+        return {"2026-08-06": 24700.0, "2026-08-07": 24650.0}[trade_date]  # both actually went up
+
+    monkeypatch.setattr(main_module.storage, "get_brief_history", fake_get_brief_history)
+    monkeypatch.setattr(main_module, "_actual_open_after", fake_actual_open_after)
+
+    r = client.get("/api/premarket/brief/history", params={"days": 30})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["hit_rate_pct"] == 50.0  # the gap-up call hit, the gap-down call missed
+    assert body["briefs"][0]["hit"] is True
+    assert body["briefs"][1]["hit"] is False
+
+
+def test_fii_trend_endpoint_passes_through_days(monkeypatch):
+    async def fake_get_fii_trend(days=30):
+        return [{"trade_date": "2026-08-10", "future_index_long": 1, "future_index_short": 1}]
+
+    monkeypatch.setattr(main_module.storage, "get_fii_trend", fake_get_fii_trend)
+
+    r = client.get("/api/premarket/positioning/fii-trend", params={"days": 7})
+    assert r.status_code == 200
+    assert r.json()["days"] == 7
+    assert len(r.json()["rows"]) == 1
