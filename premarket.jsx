@@ -38,25 +38,6 @@ function detectDefaultBackendUrl() {
 }
 const API_BASE = `${detectDefaultBackendUrl().replace(/\/$/, "")}/api/premarket`;
 
-function istHM(date) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false,
-  }).formatToParts(date);
-  return {
-    h: parseInt(parts.find((p) => p.type === "hour").value, 10),
-    m: parseInt(parts.find((p) => p.type === "minute").value, 10),
-  };
-}
-// The brief only actually changes once/day (the morning job runs once at
-// 8:15am), but polling 8:00-9:30 IST covers "brief just landed" and
-// "market's about to open, want the freshest read" without polling all day
-// for a value that isn't moving.
-function isPollingWindow(date) {
-  const { h, m } = istHM(date);
-  const mins = h * 60 + m;
-  return mins >= 8 * 60 && mins <= 9 * 60 + 30;
-}
-
 function fmtNum(v, digits = 2) {
   return typeof v === "number" && !Number.isNaN(v) ? v.toFixed(digits) : "—";
 }
@@ -115,10 +96,45 @@ function EmptyNote({ children }) {
 }
 
 /* ---------- verdict card ---------- */
-function VerdictCard({ brief }) {
+function CardIconButton({ onClick, title, active, children }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      style={{
+        width: 30, height: 30, borderRadius: "50%",
+        display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, lineHeight: 1,
+        background: active ? T.cyan : T.panel2, color: active ? T.ink : T.muted,
+        border: `1px solid ${active ? T.cyan : T.line}`, cursor: "pointer", flexShrink: 0,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// No auto-refresh (turned off deliberately) — these two small icon buttons
+// on the card itself are the only way data updates: manual refresh, and
+// toggling the history sheet/table.
+function CardCornerButtons({ showHistory, onToggleHistory, onRefresh, refreshing }) {
+  return (
+    <div style={{ position: "absolute", top: 14, right: 14, display: "flex", gap: 8 }}>
+      <CardIconButton onClick={onRefresh} title="Refresh now">
+        {refreshing ? "…" : "↻"}
+      </CardIconButton>
+      <CardIconButton onClick={onToggleHistory} title={showHistory ? "Hide history" : "Show history"} active={showHistory}>
+        🕒
+      </CardIconButton>
+    </div>
+  );
+}
+
+function VerdictCard({ brief, showHistory, onToggleHistory, onRefresh, refreshing }) {
   if (!brief || brief.score == null) {
     return (
-      <div style={{ gridColumn: "1 / -1", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 16, padding: 24 }}>
+      <div style={{ gridColumn: "1 / -1", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 16, padding: 24, position: "relative" }}>
+        <CardCornerButtons showHistory={showHistory} onToggleHistory={onToggleHistory} onRefresh={onRefresh} refreshing={refreshing} />
         <div style={{ fontFamily: DISP, fontSize: 15, color: T.muted }}>
           {brief?.note || "No brief yet — the morning job runs at 8:15am IST on trading days."}
         </div>
@@ -131,8 +147,9 @@ function VerdictCard({ brief }) {
   return (
     <div style={{
       gridColumn: "1 / -1", background: T.panel, border: `1px solid ${color}55`, borderRadius: 16, padding: 24,
-      display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap",
+      display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap", position: "relative",
     }}>
+      <CardCornerButtons showHistory={showHistory} onToggleHistory={onToggleHistory} onRefresh={onRefresh} refreshing={refreshing} />
       <div style={{
         width: 108, height: 108, borderRadius: "50%", border: `3px solid ${color}`, display: "flex",
         flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0,
@@ -164,7 +181,7 @@ function VerdictCard({ brief }) {
           {brief.components?.is_event_day && <Chip color={T.amber}>Event day — range widened</Chip>}
         </div>
       </div>
-      <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, maxWidth: 260, borderLeft: `1px solid ${T.line}`, paddingLeft: 20 }}>
+      <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, maxWidth: 220, borderLeft: `1px solid ${T.line}`, paddingLeft: 20, paddingTop: 24, paddingRight: 50 }}>
         {brief.disclaimer || "Automated analysis for information only — not investment advice."}
       </div>
     </div>
@@ -624,6 +641,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const loadBrief = useCallback(async () => {
     try {
@@ -654,29 +672,13 @@ export default function App() {
     })();
   }, [loadBrief, loadHistoryAndTrend]);
 
-  // Live cues (GIFT/US/Asia quotes, macro, positioning — everything on the
-  // brief) refresh every 60s regardless of time of day, not just the
-  // 8:00-9:30 IST window: the brief only actually changes once/day via the
-  // morning job, but a visitor checking GIFT Nifty or US markets in the
-  // evening still wants the page to pick up a fresher read (a manual job
-  // trigger, a delayed cron run, etc.) without a manual reload.
-  //
-  // loadHistoryAndTrend() (the journal sheet + FII sparkline) was
-  // previously only ever called once, on mount — neither ever updated
-  // again for the rest of the page's life. Included in the same interval
-  // now. Note for later: GET /brief/history does one Yahoo fetch per row
-  // (for actual_open), so this gets more expensive as history grows past
-  // a handful of rows — fine today, worth a dedicated slower interval if
-  // it ever becomes noticeably laggy.
-  useEffect(() => {
-    const id = setInterval(() => {
-      loadBrief();
-      loadHistoryAndTrend();
-    }, 60_000);
-    return () => clearInterval(id);
+  // No auto-refresh (explicitly turned off) — data updates only on load or
+  // via the manual refresh button on the verdict card.
+  const refreshAll = useCallback(async () => {
+    setRefreshing(true);
+    await Promise.all([loadBrief(), loadHistoryAndTrend()]);
+    setRefreshing(false);
   }, [loadBrief, loadHistoryAndTrend]);
-
-  const inMorningWindow = isPollingWindow(new Date());
 
   return (
     <div style={{ minHeight: "100%", background: T.ink, fontFamily: DISP }}>
@@ -690,11 +692,6 @@ export default function App() {
                 Updated {lastUpdated.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST
               </span>
             )}
-            <Chip color={T.put}>● Auto-refreshing (60s){inMorningWindow ? " · pre-open" : ""}</Chip>
-            <button onClick={() => setShowHistory((s) => !s)}
-              style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, cursor: "pointer", fontFamily: DISP }}>
-              {showHistory ? "Hide history" : "Show history"}
-            </button>
             <a href="./index.html"
               style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, textDecoration: "none", fontFamily: DISP }}>
               ← PCR Session Clock
@@ -709,7 +706,10 @@ export default function App() {
         )}
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
-          <VerdictCard brief={brief} />
+          <VerdictCard
+            brief={brief} showHistory={showHistory} onToggleHistory={() => setShowHistory((s) => !s)}
+            onRefresh={refreshAll} refreshing={refreshing}
+          />
           <LiveCuesPanel brief={brief} />
           <MacroPanel brief={brief} />
           <PositioningPanel brief={brief} fiiRows={fiiRows} />
