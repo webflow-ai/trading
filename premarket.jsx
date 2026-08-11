@@ -491,31 +491,46 @@ const JOURNAL_COLUMNS = [
   { key: "trades", label: "Trades", render: deriveTradesCell },
 ];
 
+// Fixed per-column widths (px) so the grid reads like an actual spreadsheet
+// instead of one giant unreadable line per cell — text-heavy columns wrap
+// within their column instead of forcing whiteSpace:nowrap to stretch the
+// whole table. Date/Verdict stay narrow since their content is always short.
+const JOURNAL_COL_WIDTH = {
+  chart: 200, option_chain: 150, pcr: 80, participant_option: 130,
+  participant_futures: 240, participant_stock: 170, gift: 150,
+  verdict: 140, trades: 260,
+};
+
 function JournalSheet({ history }) {
   const briefs = history?.briefs || [];
+  const cellStyle = { padding: "8px 10px", color: T.fg, verticalAlign: "top", borderLeft: `1px solid ${T.line}` };
   return (
     <Panel title="Pre-market journal (spreadsheet)">
       {briefs.length === 0 ? (
         <EmptyNote>No briefs yet.</EmptyNote>
       ) : (
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+        <div style={{ overflowX: "auto", border: `1px solid ${T.line}`, borderRadius: 8 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12, tableLayout: "fixed" }}>
+            <colgroup>
+              <col style={{ width: 100 }} />
+              {JOURNAL_COLUMNS.map((col) => <col key={col.key} style={{ width: JOURNAL_COL_WIDTH[col.key] }} />)}
+            </colgroup>
             <thead>
-              <tr style={{ color: T.muted, textAlign: "left" }}>
-                <th style={{ padding: "6px 10px", fontWeight: 500 }}>Date</th>
+              <tr style={{ color: T.muted, textAlign: "left", background: T.panel2 }}>
+                <th style={{ padding: "8px 10px", fontWeight: 700 }}>Date</th>
                 {JOURNAL_COLUMNS.map((col) => (
-                  <th key={col.key} style={{ padding: "6px 10px", fontWeight: 500, whiteSpace: "nowrap" }}>{col.label}</th>
+                  <th key={col.key} style={{ padding: "8px 10px", fontWeight: 700, borderLeft: `1px solid ${T.line}` }}>
+                    {col.label}
+                  </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {briefs.map((b) => (
-                <tr key={b.trade_date} style={{ borderTop: `1px solid ${T.line}` }}>
-                  <td style={{ padding: "6px 10px", color: T.fg, fontWeight: 600, whiteSpace: "nowrap" }}>{b.trade_date}</td>
+              {briefs.map((b, i) => (
+                <tr key={b.trade_date} style={{ borderTop: `1px solid ${T.line}`, background: i % 2 ? T.panel2 : "transparent" }}>
+                  <td style={{ padding: "8px 10px", color: T.fg, fontWeight: 700, verticalAlign: "top" }}>{b.trade_date}</td>
                   {JOURNAL_COLUMNS.map((col) => (
-                    <td key={col.key} style={{ padding: "6px 10px", color: T.fg, whiteSpace: "nowrap" }}>
-                      {col.render(b)}
-                    </td>
+                    <td key={col.key} style={cellStyle}>{col.render(b)}</td>
                   ))}
                 </tr>
               ))}
@@ -626,10 +641,21 @@ export default function App() {
   // morning job, but a visitor checking GIFT Nifty or US markets in the
   // evening still wants the page to pick up a fresher read (a manual job
   // trigger, a delayed cron run, etc.) without a manual reload.
+  //
+  // loadHistoryAndTrend() (the journal sheet + FII sparkline) was
+  // previously only ever called once, on mount — neither ever updated
+  // again for the rest of the page's life. Included in the same interval
+  // now. Note for later: GET /brief/history does one Yahoo fetch per row
+  // (for actual_open), so this gets more expensive as history grows past
+  // a handful of rows — fine today, worth a dedicated slower interval if
+  // it ever becomes noticeably laggy.
   useEffect(() => {
-    const id = setInterval(loadBrief, 60_000);
+    const id = setInterval(() => {
+      loadBrief();
+      loadHistoryAndTrend();
+    }, 60_000);
     return () => clearInterval(id);
-  }, [loadBrief]);
+  }, [loadBrief, loadHistoryAndTrend]);
 
   const inMorningWindow = isPollingWindow(new Date());
 
