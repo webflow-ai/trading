@@ -623,6 +623,7 @@ export default function App() {
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [showHistory, setShowHistory] = useState(false);
 
   const loadBrief = useCallback(async () => {
     try {
@@ -690,6 +691,10 @@ export default function App() {
               </span>
             )}
             <Chip color={T.put}>● Auto-refreshing (60s){inMorningWindow ? " · pre-open" : ""}</Chip>
+            <button onClick={() => setShowHistory((s) => !s)}
+              style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, cursor: "pointer", fontFamily: DISP }}>
+              {showHistory ? "Hide history" : "Show history"}
+            </button>
             <a href="./index.html"
               style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, textDecoration: "none", fontFamily: DISP }}>
               ← PCR Session Clock
@@ -711,12 +716,16 @@ export default function App() {
           <ParticipantPanel brief={brief} />
           <EventsNewsPanel brief={brief} />
           <LevelsPanel brief={brief} />
-          <div style={{ gridColumn: "1 / -1" }}>
-            <JournalSheet history={history} />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <HistoryTable history={history} />
-          </div>
+          {showHistory && (
+            <>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <JournalSheet history={history} />
+              </div>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <HistoryTable history={history} />
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>
