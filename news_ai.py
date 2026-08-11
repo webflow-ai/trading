@@ -24,12 +24,23 @@ ended ... switch to the `google.genai` package" — printed as a
 FutureWarning on every import). It still works as of the test above, but a
 migration to `google-genai` is a real, not-yet-scheduled follow-up.
 
-Verified live 2026-08-11 (again): reuters_business 301-redirected
-www.reutersagency.com -> reutersagency.com (no www), which the shared
-client wasn't following, so that source silently contributed zero
-headlines every run. Fixed to the redirect target directly, and the client
-now follows redirects generally so a future host-name change like this
-degrades gracefully instead of dropping the source outright.
+Verified live 2026-08-11 (again): reuters_business 301-redirects
+www.reutersagency.com -> reutersagency.com, but the redirect target itself
+404s when hit directly (query-string/referrer handling on Reuters' side,
+not something worth reverse-engineering) — the *redirect chain* works, a
+hardcoded guess at its destination doesn't. Left the original www URL and
+turned on follow_redirects so httpx does the actual redirect instead of us
+guessing it.
+
+Verified live 2026-08-11 (a third time): production round-trips for this
+module were taking 20+ seconds, most of it not the RSS/network calls above
+but `google-generativeai` itself — a ~50MB dependency tree (grpcio,
+google-api-python-client, cryptography, protobuf, ...) that Vercel's Python
+runtime reinstalls from scratch on every cold invocation, for what is, at
+its core, one JSON-in/JSON-out HTTP call. Replaced with a direct httpx POST
+to Gemini's REST API — matches every other integration in this codebase
+(Supabase, Telegram, NSE, Yahoo all use raw httpx, no SDKs) and removes the
+dependency entirely.
 """
 
 import asyncio
@@ -45,10 +56,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
 RSS_FEEDS = {
-    "reuters_business": "https://reutersagency.com/feed/?best-topics=business-finance",
+    "reuters_business": "https://www.reutersagency.com/feed/?best-topics=business-finance",
     "moneycontrol": "https://www.moneycontrol.com/rss/marketreports.xml",
     "et_markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
 }
+
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 HEADLINE_WINDOW_HOURS = 12
 MAX_HEADLINES = 25
@@ -198,26 +211,37 @@ def _parse_gemini_response(text: str) -> dict:
     }
 
 
-async def classify_headlines(headlines: list[str]) -> dict:
+async def classify_headlines(headlines: list[str], client: httpx.AsyncClient | None = None) -> dict:
     """{"items": [{"headline", "sentiment", "reason"}, ...],
     "overall_sentiment": "<one-line>", "note": str|None}. Falls back to an
     all-neutral result (never raises) if Gemini isn't configured or the call
-    fails, per the brief's own instruction."""
+    fails, per the brief's own instruction.
+
+    Raw REST (POST .../models/{model}:generateContent?key=...), not the
+    google-generativeai SDK — see this module's docstring for why."""
     if not headlines:
         return {"items": [], "overall_sentiment": "No headlines available.", "note": None}
     if not GEMINI_API_KEY:
         print("news_ai: GEMINI_API_KEY not set, returning neutral fallback")
         return _neutral_fallback(headlines, note="GEMINI_API_KEY not configured")
+    owns_client = client is None
+    client = client or httpx.AsyncClient(timeout=30)
     try:
-        import google.generativeai as genai  # imported lazily so the rest of the engine works without this dependency installed
-
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = await asyncio.to_thread(model.generate_content, _build_prompt(headlines))
-        return _parse_gemini_response(response.text)
+        resp = await client.post(
+            GEMINI_API_URL.format(model=GEMINI_MODEL),
+            params={"key": GEMINI_API_KEY},
+            json={"contents": [{"parts": [{"text": _build_prompt(headlines)}]}]},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return _parse_gemini_response(text)
     except Exception as e:
         print(f"news_ai: Gemini classification failed: {e}")
         return _neutral_fallback(headlines, note=f"Gemini call failed: {e}")
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def get_news_brief(now: dt.datetime | None = None) -> dict:

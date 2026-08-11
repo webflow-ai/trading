@@ -1,11 +1,35 @@
 import asyncio
 import datetime as dt
-import sys
-import types
 
 import httpx
 
 import news_ai
+
+
+class FakeResponse:
+    def __init__(self, json_data=None, raise_exc=None):
+        self._json = json_data
+        self._raise_exc = raise_exc
+
+    def raise_for_status(self):
+        if self._raise_exc:
+            raise self._raise_exc
+
+    def json(self):
+        return self._json
+
+
+class FakeAsyncClient:
+    def __init__(self, response=None):
+        self._response = response
+        self.calls = []
+
+    async def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self._response
+
+    async def aclose(self):
+        pass
 
 RSS_SAMPLE = """<?xml version="1.0"?>
 <rss version="2.0"><channel>
@@ -121,50 +145,32 @@ def test_classify_headlines_falls_back_to_neutral_when_gemini_not_configured(mon
 
 def test_classify_headlines_falls_back_to_neutral_when_gemini_call_fails(monkeypatch):
     monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
+    client = FakeAsyncClient(response=FakeResponse(raise_exc=httpx.HTTPError("Gemini unreachable")))
 
-    class FailingModel:
-        def __init__(self, name):
-            pass
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
 
-        def generate_content(self, prompt):
-            raise RuntimeError("Gemini unreachable")
-
-    fake_genai = types.SimpleNamespace(configure=lambda api_key: None, GenerativeModel=FailingModel)
-    monkeypatch.setitem(sys.modules, "google.generativeai", fake_genai)
-
-    result = asyncio.run(news_ai.classify_headlines(["H1"]))
     assert "Gemini unreachable" in result["note"]
     assert result["items"][0]["sentiment"] == "neutral"
 
 
 def test_classify_headlines_returns_parsed_result_on_success(monkeypatch):
     monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
-    calls = {}
+    gemini_json = {
+        "candidates": [{"content": {"parts": [{"text":
+            '{"items": [{"headline": "H1", "sentiment": "bullish", "reason": "strong inflows"}], '
+            '"overall_sentiment": "Mildly bullish on FII inflows"}'
+        }]}}],
+    }
+    client = FakeAsyncClient(response=FakeResponse(json_data=gemini_json))
 
-    class FakeModel:
-        def __init__(self, name):
-            calls["model_name"] = name
-
-        def generate_content(self, prompt):
-            calls["prompt"] = prompt
-
-            class R:
-                text = ('{"items": [{"headline": "H1", "sentiment": "bullish", "reason": "strong inflows"}], '
-                         '"overall_sentiment": "Mildly bullish on FII inflows"}')
-            return R()
-
-    fake_genai = types.SimpleNamespace(
-        configure=lambda api_key: calls.update({"api_key": api_key}),
-        GenerativeModel=FakeModel,
-    )
-    monkeypatch.setitem(sys.modules, "google.generativeai", fake_genai)
-
-    result = asyncio.run(news_ai.classify_headlines(["H1"]))
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
 
     assert result["overall_sentiment"] == "Mildly bullish on FII inflows"
     assert result["items"][0]["sentiment"] == "bullish"
-    assert calls["api_key"] == "fake-key"
-    assert "H1" in calls["prompt"]
+    url, kwargs = client.calls[0]
+    assert url == news_ai.GEMINI_API_URL.format(model=news_ai.GEMINI_MODEL)
+    assert kwargs["params"] == {"key": "fake-key"}
+    assert "H1" in kwargs["json"]["contents"][0]["parts"][0]["text"]
 
 
 # ---------------- top market-moving selection ----------------
