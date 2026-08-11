@@ -20,6 +20,7 @@ they're actually consumed by scoring.
 
 import asyncio
 import datetime as dt
+import time
 
 import httpx
 
@@ -103,6 +104,7 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
     all of them.
     """
     today = dt.datetime.now(IST).date()
+    t0 = time.monotonic()
 
     async with httpx.AsyncClient(timeout=15) as client:
         gift, us_quotes, asia_quotes, macro_quotes, levels, structure = await asyncio.gather(
@@ -113,12 +115,16 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
             technicals.compute_levels(client),
             technicals.compute_structure(client),
         )
+    t1 = time.monotonic()
+    print(f"jobs: morning quotes/levels/structure took {t1 - t0:.2f}s")
 
     await storage.save_macro_snapshots(
         "morning",
         {**{k: v for k, v in us_quotes.items() if v}, **{k: v for k, v in asia_quotes.items() if v},
          **{k: v for k, v in macro_quotes.items() if v}},
     )
+    t2 = time.monotonic()
+    print(f"jobs: morning save_macro_snapshots took {t2 - t1:.2f}s")
 
     fii, option_snap, participants, fii_dii_cash = await asyncio.gather(
         positioning.compute_fii_positioning(),
@@ -126,6 +132,8 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
         positioning.participant_snapshot(),
         positioning.fii_dii_cash_snapshot(),
     )
+    t3 = time.monotonic()
+    print(f"jobs: morning positioning gather took {t3 - t2:.2f}s")
 
     crude = macro_quotes.get("crude")
     usdinr = macro_quotes.get("usdinr")
@@ -156,11 +164,13 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
         previous_close=inputs["previous_close"], gift_price=inputs["gift_price"], score=score_result["score"],
     )
 
+    t4 = time.monotonic()
     try:
         news = await news_ai.get_news_brief()
     except Exception as e:
         print(f"jobs: news_ai.get_news_brief failed: {e}")
         news = {"headlines": [], "news_sentiment": None}
+    print(f"jobs: morning news_ai.get_news_brief took {time.monotonic() - t4:.2f}s")
 
     brief = {
         "trade_date": today.isoformat(),

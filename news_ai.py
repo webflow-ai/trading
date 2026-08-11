@@ -48,6 +48,7 @@ import datetime as dt
 import email.utils
 import json
 import os
+import time
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -250,8 +251,12 @@ async def get_news_brief(now: dt.datetime | None = None) -> dict:
     trimmed to TOP_NEWS_COUNT — up to MAX_HEADLINES are fetched and
     classified for a fuller read on `overall_sentiment`, but only the
     handful most likely to actually move the market are kept for display."""
+    t0 = time.monotonic()
     items = await fetch_all_headlines(now=now)
+    t1 = time.monotonic()
+    print(f"news_ai: fetch_all_headlines took {t1 - t0:.2f}s ({len(items)} headlines)")
     classified = await classify_headlines([it["headline"] for it in items])
+    print(f"news_ai: classify_headlines took {time.monotonic() - t1:.2f}s")
     return {
         "headlines": select_top_market_moving(classified["items"]),
         "news_sentiment": classified["overall_sentiment"],
