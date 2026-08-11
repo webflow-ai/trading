@@ -37,6 +37,10 @@ function detectDefaultBackendUrl() {
   return isLocalDev ? `${protocol}//${hostname}:8000` : origin;
 }
 const API_BASE = `${detectDefaultBackendUrl().replace(/\/$/, "")}/api/premarket`;
+// Same origin, the existing PCR tracker's app (api/index.py, not this
+// engine) — reused only to pull a live option premium for the paper
+// trading form's "fetch live" button, nothing else.
+const PCR_API_BASE = `${detectDefaultBackendUrl().replace(/\/$/, "")}/api`;
 
 function fmtNum(v, digits = 2) {
   return typeof v === "number" && !Number.isNaN(v) ? v.toFixed(digits) : "—";
@@ -53,6 +57,17 @@ async function getJSON(path) {
   const res = await fetch(`${API_BASE}${path}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+async function postJSON(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error((data && data.detail) || `HTTP ${res.status}`);
+  return data;
 }
 
 /* ---------- small building blocks ---------- */
@@ -377,6 +392,255 @@ function ParticipantPanel({ brief }) {
         color={cash?.fii_buy != null && cash?.fii_sell != null ? directionColor(cash.fii_buy - cash.fii_sell) : undefined} />
       <Row label="DII cash" value={cash?.dii_buy != null ? `buy ${fmtNum(cash.dii_buy, 0)} / sell ${fmtNum(cash.dii_sell, 0)}` : "unavailable"}
         color={cash?.dii_buy != null && cash?.dii_sell != null ? directionColor(cash.dii_buy - cash.dii_sell) : undefined} />
+    </Panel>
+  );
+}
+
+/* ---------- paper trading journal ----------
+   Simulated options trades: opened with an entry premium (typed in, or
+   pulled from the existing PCR tracker's live option chain at
+   /api/optionchain/today — same origin, a different app), closed later
+   with an exit premium, PnL computed server-side at close time. Nothing
+   here places a real order. */
+const OPTION_TYPES = ["CE", "PE"];
+const TRADE_ACTIONS = ["BUY", "SELL"];
+const DEFAULT_LOT_SIZE_FALLBACK = 75; // mirrors paper_trading.DEFAULT_LOT_SIZE — see that module's own caveat about this being a guess, not an authoritative current value
+
+const formLabelStyle = { display: "block", fontFamily: DISP, fontSize: 10, color: T.muted, marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.4 };
+const formInputStyle = { background: T.ink, border: `1px solid ${T.line}`, color: T.fg, borderRadius: 6, padding: "6px 8px", fontFamily: MONO, fontSize: 12, width: "100%", boxSizing: "border-box" };
+function formButtonStyle(primary, disabled) {
+  return {
+    background: primary ? T.cyan : T.panel2, color: primary ? T.ink : T.fg,
+    border: `1px solid ${primary ? T.cyan : T.line}`, borderRadius: 6, padding: "0 12px", height: 30,
+    fontFamily: DISP, fontSize: 12, fontWeight: 600, cursor: disabled ? "default" : "pointer",
+    opacity: disabled ? 0.5 : 1, flexShrink: 0,
+  };
+}
+const tradeThStyle = { padding: "6px 8px", fontWeight: 500, whiteSpace: "nowrap" };
+const tradeTdStyle = { padding: "6px 8px", color: T.fg, whiteSpace: "nowrap" };
+
+function PaperTradingPanel() {
+  const [trades, setTrades] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [form, setForm] = useState({
+    strike: "", optionType: "CE", action: "BUY", lots: 1, lotSize: DEFAULT_LOT_SIZE_FALLBACK, entryPrice: "", notes: "",
+  });
+  const [fetchingLtp, setFetchingLtp] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [closingDrafts, setClosingDrafts] = useState({});
+
+  const load = useCallback(async () => {
+    try {
+      const json = await getJSON("/paper-trades?days=90");
+      setTrades(json.trades || []);
+      setSummary(json.summary || null);
+      setErr("");
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const fetchLivePremium = async () => {
+    if (!form.strike) return;
+    setFetchingLtp(true);
+    try {
+      const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const row = (json.rows || []).find((r) => Number(r.strike) === Number(form.strike));
+      if (!row) {
+        setErr(`No live data for strike ${form.strike} — try a strike closer to spot, or type the premium in manually.`);
+        return;
+      }
+      const ltp = form.optionType === "CE" ? row.ceLtp : row.peLtp;
+      if (ltp == null) {
+        setErr(`Strike ${form.strike} found, but no ${form.optionType} premium in the response.`);
+        return;
+      }
+      setForm((f) => ({ ...f, entryPrice: String(ltp) }));
+      setErr("");
+    } catch (e) {
+      setErr(`Couldn't fetch live premium: ${e.message}`);
+    } finally {
+      setFetchingLtp(false);
+    }
+  };
+
+  const submitTrade = async (e) => {
+    e.preventDefault();
+    if (!form.strike || !form.entryPrice) {
+      setErr("Strike and entry price are required.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await postJSON("/paper-trades", {
+        strike: Number(form.strike),
+        option_type: form.optionType,
+        action: form.action,
+        entry_price: Number(form.entryPrice),
+        lots: Number(form.lots) || 1,
+        lot_size: Number(form.lotSize) || DEFAULT_LOT_SIZE_FALLBACK,
+        notes: form.notes || null,
+      });
+      setForm((f) => ({ ...f, strike: "", entryPrice: "", notes: "" }));
+      setErr("");
+      await load();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submitClose = async (tradeId) => {
+    const exitPrice = closingDrafts[tradeId];
+    if (!exitPrice) return;
+    try {
+      await postJSON(`/paper-trades/${tradeId}/close`, { exit_price: Number(exitPrice) });
+      setClosingDrafts((c) => {
+        const next = { ...c };
+        delete next[tradeId];
+        return next;
+      });
+      setErr("");
+      await load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  return (
+    <Panel
+      title="Paper trading journal"
+      right={summary && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Chip color={T.muted}>{summary.open_count} open</Chip>
+          {summary.win_rate_pct != null && (
+            <Chip color={summary.win_rate_pct >= 50 ? T.put : T.call}>Win rate: {summary.win_rate_pct}%</Chip>
+          )}
+          <Chip color={directionColor(summary.total_pnl)}>Total PnL: {fmtSigned(summary.total_pnl, 0)}</Chip>
+        </div>
+      )}
+    >
+      <form onSubmit={submitTrade} style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "flex-end", marginBottom: 16 }}>
+        <div style={{ width: 100 }}>
+          <label style={formLabelStyle}>Strike</label>
+          <input type="number" value={form.strike} placeholder="24500"
+            onChange={(e) => setForm((f) => ({ ...f, strike: e.target.value }))} style={formInputStyle} />
+        </div>
+        <div style={{ width: 70 }}>
+          <label style={formLabelStyle}>Type</label>
+          <select value={form.optionType} onChange={(e) => setForm((f) => ({ ...f, optionType: e.target.value }))} style={formInputStyle}>
+            {OPTION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+        <div style={{ width: 85 }}>
+          <label style={formLabelStyle}>Action</label>
+          <select value={form.action} onChange={(e) => setForm((f) => ({ ...f, action: e.target.value }))} style={formInputStyle}>
+            {TRADE_ACTIONS.map((a) => <option key={a} value={a}>{a}</option>)}
+          </select>
+        </div>
+        <div style={{ width: 65 }}>
+          <label style={formLabelStyle}>Lots</label>
+          <input type="number" min="1" value={form.lots}
+            onChange={(e) => setForm((f) => ({ ...f, lots: e.target.value }))} style={formInputStyle} />
+        </div>
+        <div style={{ width: 90 }}>
+          <label style={formLabelStyle} title="NSE revises this periodically — confirm the current value before trusting PnL.">Lot size</label>
+          <input type="number" min="1" value={form.lotSize}
+            onChange={(e) => setForm((f) => ({ ...f, lotSize: e.target.value }))} style={formInputStyle} />
+        </div>
+        <div style={{ width: 110 }}>
+          <label style={formLabelStyle}>Entry premium</label>
+          <input type="number" step="0.05" value={form.entryPrice} placeholder="120.50"
+            onChange={(e) => setForm((f) => ({ ...f, entryPrice: e.target.value }))} style={formInputStyle} />
+        </div>
+        <button type="button" onClick={fetchLivePremium} disabled={!form.strike || fetchingLtp} style={formButtonStyle(false, !form.strike || fetchingLtp)}>
+          {fetchingLtp ? "Fetching…" : "Fetch live"}
+        </button>
+        <div style={{ flex: 1, minWidth: 140 }}>
+          <label style={formLabelStyle}>Notes (optional)</label>
+          <input type="text" value={form.notes} placeholder="why this trade"
+            onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} style={formInputStyle} />
+        </div>
+        <button type="submit" disabled={submitting} style={formButtonStyle(true, submitting)}>
+          {submitting ? "Adding…" : "Add trade"}
+        </button>
+      </form>
+
+      {err && (
+        <div style={{ marginBottom: 12, padding: "8px 12px", background: `${T.call}18`, border: `1px solid ${T.call}55`, borderRadius: 8, color: T.call, fontSize: 12 }}>
+          {err}
+        </div>
+      )}
+
+      {loading ? (
+        <EmptyNote>Loading trades…</EmptyNote>
+      ) : trades.length === 0 ? (
+        <EmptyNote>No paper trades yet — add one above.</EmptyNote>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+            <thead>
+              <tr style={{ color: T.muted, textAlign: "left" }}>
+                <th style={tradeThStyle}>Date</th>
+                <th style={tradeThStyle}>Strike</th>
+                <th style={tradeThStyle}>Type</th>
+                <th style={tradeThStyle}>Action</th>
+                <th style={tradeThStyle}>Lots</th>
+                <th style={tradeThStyle}>Entry</th>
+                <th style={tradeThStyle}>Exit</th>
+                <th style={tradeThStyle}>PnL</th>
+                <th style={tradeThStyle}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trades.map((t) => (
+                <tr key={t.id} style={{ borderTop: `1px solid ${T.line}` }}>
+                  <td style={tradeTdStyle}>{t.trade_date}</td>
+                  <td style={tradeTdStyle}>{fmtNum(t.strike, 0)}</td>
+                  <td style={tradeTdStyle}>{t.option_type}</td>
+                  <td style={tradeTdStyle}>{t.action}</td>
+                  <td style={tradeTdStyle}>{t.lots}</td>
+                  <td style={tradeTdStyle}>{fmtNum(t.entry_price, 2)}</td>
+                  <td style={tradeTdStyle}>{t.exit_price != null ? fmtNum(t.exit_price, 2) : "—"}</td>
+                  <td style={{ ...tradeTdStyle, color: t.pnl != null ? directionColor(t.pnl) : T.muted, fontWeight: 700 }}>
+                    {t.pnl != null ? fmtSigned(t.pnl, 0) : "—"}
+                  </td>
+                  <td style={tradeTdStyle}>
+                    {t.status === "open" ? (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <input type="number" step="0.05" placeholder="exit premium" value={closingDrafts[t.id] || ""}
+                          onChange={(e) => setClosingDrafts((c) => ({ ...c, [t.id]: e.target.value }))}
+                          style={{ ...formInputStyle, width: 90 }} />
+                        <button onClick={() => submitClose(t.id)} disabled={!closingDrafts[t.id]}
+                          style={formButtonStyle(false, !closingDrafts[t.id])}>
+                          Close
+                        </button>
+                      </div>
+                    ) : (
+                      <Chip color={T.muted}>closed</Chip>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{ height: 8 }} />
+      <EmptyNote>
+        Simulated trades only — nothing here places a real order. Entry/exit premiums are either typed in or pulled
+        from the existing PCR tracker's live option chain (not every strike may be available there); lot size
+        defaults to a guess and should be confirmed against NSE's current contract spec before trusting PnL figures.
+      </EmptyNote>
     </Panel>
   );
 }
@@ -716,6 +980,9 @@ export default function App() {
           <ParticipantPanel brief={brief} />
           <EventsNewsPanel brief={brief} />
           <LevelsPanel brief={brief} />
+          <div style={{ gridColumn: "1 / -1" }}>
+            <PaperTradingPanel />
+          </div>
           {showHistory && (
             <>
               <div style={{ gridColumn: "1 / -1" }}>

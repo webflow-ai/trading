@@ -19,13 +19,19 @@ class FakeResponse:
 
 
 class FakeAsyncClient:
-    def __init__(self, get_response=None):
+    def __init__(self, get_response=None, post_response=None, patch_response=None):
         self.calls = []
         self._get_response = get_response if get_response is not None else FakeResponse([])
+        self._post_response = post_response if post_response is not None else FakeResponse()
+        self._patch_response = patch_response if patch_response is not None else FakeResponse()
 
     async def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
-        return FakeResponse()
+        return self._post_response
+
+    async def patch(self, url, **kwargs):
+        self.calls.append(("PATCH", url, kwargs))
+        return self._patch_response
 
     async def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
@@ -267,3 +273,112 @@ def test_get_latest_pcr_snapshot_returns_first_row(monkeypatch):
 
     result = asyncio.run(storage.get_latest_pcr_snapshot("NIFTY"))
     assert result == rows[0]
+
+
+# ---------------- paper trades ----------------
+
+def test_create_paper_trade_posts_and_returns_representation(fake_client):
+    fake_client._post_response = FakeResponse([{"id": 7, "strike": 24500, "status": "open"}])
+
+    trade = {"trade_date": "2026-08-12", "strike": 24500, "option_type": "CE", "action": "BUY",
+              "lots": 1, "lot_size": 75, "entry_price": 120.5, "status": "open"}
+    result = asyncio.run(storage.create_paper_trade(trade))
+
+    assert result == {"id": 7, "strike": 24500, "status": "open"}
+    method, url, kwargs = fake_client.calls[0]
+    assert method == "POST"
+    assert url == "https://fake.supabase.co/rest/v1/paper_trades"
+    assert kwargs["headers"]["Prefer"] == "return=representation"
+    assert kwargs["json"] == trade
+
+
+def test_create_paper_trade_skips_when_not_configured(monkeypatch):
+    monkeypatch.setattr(storage, "SUPABASE_URL", None)
+    monkeypatch.setattr(storage, "SUPABASE_KEY", None)
+
+    async def fail_if_called():
+        raise AssertionError("get_client() should not be called when Supabase isn't configured")
+    monkeypatch.setattr(storage, "get_client", fail_if_called)
+
+    trade = {"strike": 24500}
+    result = asyncio.run(storage.create_paper_trade(trade))
+    assert result == {"strike": 24500, "id": None}
+
+
+def test_update_paper_trade_patches_by_id_and_returns_row(monkeypatch):
+    client = FakeAsyncClient(patch_response=FakeResponse([{"id": 7, "status": "closed", "pnl": 375.0}]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    patch = {"status": "closed", "exit_price": 125.5, "pnl": 375.0}
+    result = asyncio.run(storage.update_paper_trade(7, patch))
+
+    assert result == {"id": 7, "status": "closed", "pnl": 375.0}
+    method, url, kwargs = client.calls[0]
+    assert method == "PATCH"
+    assert url == "https://fake.supabase.co/rest/v1/paper_trades"
+    assert kwargs["params"] == {"id": "eq.7"}
+    assert kwargs["json"] == patch
+
+
+def test_update_paper_trade_returns_none_when_no_row_matched(monkeypatch):
+    client = FakeAsyncClient(patch_response=FakeResponse([]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    assert asyncio.run(storage.update_paper_trade(999, {"status": "closed"})) is None
+
+
+def test_get_paper_trades_filters_by_status_when_given(monkeypatch):
+    client = FakeAsyncClient(get_response=FakeResponse([{"id": 1, "status": "open"}]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    result = asyncio.run(storage.get_paper_trades(status="open", days=30))
+
+    assert result == [{"id": 1, "status": "open"}]
+    method, url, kwargs = client.calls[0]
+    assert kwargs["params"] == {"order": "created_at.desc", "limit": "150", "status": "eq.open"}
+
+
+def test_get_paper_trades_omits_status_filter_when_not_given(monkeypatch):
+    client = FakeAsyncClient(get_response=FakeResponse([]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    asyncio.run(storage.get_paper_trades())
+
+    method, url, kwargs = client.calls[0]
+    assert "status" not in kwargs["params"]
+
+
+def test_get_paper_trade_returns_single_row_by_id(monkeypatch):
+    client = FakeAsyncClient(get_response=FakeResponse([{"id": 7, "strike": 24500}]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    result = asyncio.run(storage.get_paper_trade(7))
+
+    assert result == {"id": 7, "strike": 24500}
+    method, url, kwargs = client.calls[0]
+    assert kwargs["params"] == {"id": "eq.7", "limit": "1"}
+
+
+def test_get_paper_trade_returns_none_when_not_found(monkeypatch):
+    client = FakeAsyncClient(get_response=FakeResponse([]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    assert asyncio.run(storage.get_paper_trade(999)) is None

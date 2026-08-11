@@ -195,3 +195,52 @@ async def get_latest_pcr_snapshot(symbol: str) -> dict | None:
         "pcr_snapshots", symbol=f"eq.{symbol}", order="created_at.desc", limit="1",
     )
     return rows[0] if rows else None
+
+
+# ---------------- paper trading journal ----------------
+
+async def create_paper_trade(trade: dict) -> dict:
+    """Inserts one paper trade and returns the created row (including its
+    `id`), so the caller has something to reference when closing it later.
+    Falls back to echoing the input with id=None when Supabase isn't
+    configured, same no-op-but-don't-crash convention as everything else
+    here."""
+    if not configured():
+        print("storage: SUPABASE_URL/SUPABASE_SERVICE_KEY not set, skipping paper trade insert")
+        return {**trade, "id": None}
+    client = await get_client()
+    headers = _headers()
+    headers["Prefer"] = "return=representation"
+    resp = await client.post(f"{SUPABASE_URL}/rest/v1/paper_trades", headers=headers, json=trade)
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else {**trade, "id": None}
+
+
+async def update_paper_trade(trade_id: int, patch: dict) -> dict | None:
+    """Partial update — used to close a trade (status/exit_price/exit_time/
+    pnl) but generic over whatever fields are passed."""
+    if not configured():
+        print(f"storage: SUPABASE_URL/SUPABASE_SERVICE_KEY not set, skipping paper trade #{trade_id} update")
+        return None
+    client = await get_client()
+    headers = _headers()
+    headers["Prefer"] = "return=representation"
+    resp = await client.patch(
+        f"{SUPABASE_URL}/rest/v1/paper_trades", params={"id": f"eq.{trade_id}"}, headers=headers, json=patch,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+async def get_paper_trades(status: str | None = None, days: int = 90) -> list[dict]:
+    params = {"order": "created_at.desc", "limit": str(max(days * 5, 50))}
+    if status:
+        params["status"] = f"eq.{status}"
+    return await _select("paper_trades", **params)
+
+
+async def get_paper_trade(trade_id: int) -> dict | None:
+    rows = await _select("paper_trades", id=f"eq.{trade_id}", limit="1")
+    return rows[0] if rows else None

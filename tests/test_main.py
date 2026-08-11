@@ -122,3 +122,84 @@ def test_fii_trend_endpoint_passes_through_days(monkeypatch):
     assert r.status_code == 200
     assert r.json()["days"] == 7
     assert len(r.json()["rows"]) == 1
+
+
+# ---------------- paper trades ----------------
+
+def test_create_paper_trade_endpoint_success(monkeypatch):
+    captured = {}
+
+    async def fake_open_trade(**kwargs):
+        captured.update(kwargs)
+        return {"id": 1, "status": "open", **kwargs}
+
+    monkeypatch.setattr(main_module.paper_trading, "open_trade", fake_open_trade)
+
+    r = client.post("/api/premarket/paper-trades", json={
+        "strike": 24500, "option_type": "CE", "action": "BUY", "entry_price": 120.5, "lots": 2,
+    })
+    assert r.status_code == 200
+    assert r.json()["id"] == 1
+    assert captured["strike"] == 24500
+    assert captured["lots"] == 2
+
+
+def test_create_paper_trade_endpoint_rejects_missing_fields():
+    r = client.post("/api/premarket/paper-trades", json={"strike": 24500})
+    assert r.status_code == 400
+
+
+def test_create_paper_trade_endpoint_rejects_bad_option_type():
+    r = client.post("/api/premarket/paper-trades", json={
+        "strike": 24500, "option_type": "XX", "action": "BUY", "entry_price": 100,
+    })
+    assert r.status_code == 400
+
+
+def test_create_paper_trade_endpoint_rejects_bad_action():
+    r = client.post("/api/premarket/paper-trades", json={
+        "strike": 24500, "option_type": "CE", "action": "HOLD", "entry_price": 100,
+    })
+    assert r.status_code == 400
+
+
+def test_close_paper_trade_endpoint_success(monkeypatch):
+    async def fake_close_trade(trade_id, exit_price):
+        assert trade_id == 7
+        assert exit_price == 125.0
+        return {"id": 7, "status": "closed", "pnl": 1875.0}
+
+    monkeypatch.setattr(main_module.paper_trading, "close_trade", fake_close_trade)
+
+    r = client.post("/api/premarket/paper-trades/7/close", json={"exit_price": 125.0})
+    assert r.status_code == 200
+    assert r.json()["pnl"] == 1875.0
+
+
+def test_close_paper_trade_endpoint_requires_exit_price():
+    r = client.post("/api/premarket/paper-trades/7/close", json={})
+    assert r.status_code == 400
+
+
+def test_close_paper_trade_endpoint_404_when_not_found(monkeypatch):
+    async def fake_close_trade(trade_id, exit_price):
+        return None
+
+    monkeypatch.setattr(main_module.paper_trading, "close_trade", fake_close_trade)
+
+    r = client.post("/api/premarket/paper-trades/999/close", json={"exit_price": 100})
+    assert r.status_code == 404
+
+
+def test_list_paper_trades_endpoint_returns_trades_and_summary(monkeypatch):
+    async def fake_get_paper_trades(status=None, days=90):
+        return [{"id": 1, "status": "closed", "pnl": 500.0}, {"id": 2, "status": "open"}]
+
+    monkeypatch.setattr(main_module.storage, "get_paper_trades", fake_get_paper_trades)
+
+    r = client.get("/api/premarket/paper-trades")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["trades"]) == 2
+    assert body["summary"]["total_pnl"] == 500.0
+    assert body["summary"]["open_count"] == 1

@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import jobs
 import market_data
+import paper_trading
 import storage
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -127,6 +128,46 @@ async def brief_history(days: int = Query(30)):
 @app.get("/api/premarket/positioning/fii-trend")
 async def positioning_fii_trend(days: int = Query(30)):
     return {"days": days, "rows": await storage.get_fii_trend(days=days)}
+
+
+@app.post("/api/premarket/paper-trades")
+async def create_paper_trade_endpoint(payload: dict):
+    required = ["strike", "option_type", "action", "entry_price"]
+    missing = [k for k in required if payload.get(k) is None]
+    if missing:
+        raise HTTPException(400, f"missing fields: {', '.join(missing)}")
+    if payload["option_type"] not in ("CE", "PE"):
+        raise HTTPException(400, "option_type must be 'CE' or 'PE'")
+    if payload["action"] not in ("BUY", "SELL"):
+        raise HTTPException(400, "action must be 'BUY' or 'SELL'")
+    trade = await paper_trading.open_trade(
+        strike=payload["strike"],
+        option_type=payload["option_type"],
+        action=payload["action"],
+        entry_price=payload["entry_price"],
+        lots=payload.get("lots", 1),
+        lot_size=payload.get("lot_size", paper_trading.DEFAULT_LOT_SIZE),
+        symbol=payload.get("symbol", "NIFTY"),
+        notes=payload.get("notes"),
+    )
+    return trade
+
+
+@app.post("/api/premarket/paper-trades/{trade_id}/close")
+async def close_paper_trade_endpoint(trade_id: int, payload: dict):
+    exit_price = payload.get("exit_price")
+    if exit_price is None:
+        raise HTTPException(400, "exit_price required")
+    trade = await paper_trading.close_trade(trade_id, exit_price)
+    if not trade:
+        raise HTTPException(404, "trade not found, or already closed")
+    return trade
+
+
+@app.get("/api/premarket/paper-trades")
+async def list_paper_trades_endpoint(status: str | None = Query(None), days: int = Query(90)):
+    trades = await storage.get_paper_trades(status=status, days=days)
+    return {"trades": trades, "summary": paper_trading.summarize(trades)}
 
 
 @app.get("/api/premarket/health")
