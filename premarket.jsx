@@ -413,6 +413,124 @@ function LevelsPanel({ brief }) {
   );
 }
 
+/* ---------- daily journal spreadsheet ----------
+   One row per trading day, columns matching the manual pre-market checklist
+   this replaces (Chart / Option Chain / PCR / Participant Option Data /
+   Participant Futures Data / Participant Stock Data / GIFT Nifty / Verdict
+   / Trades). Built entirely from data GET /brief/history already returns —
+   no new backend endpoint. Cells that this engine genuinely doesn't compute
+   yet (Option Chain, PCR, Participant Option Data) say so plainly rather
+   than being left blank or guessed at; "Trades" is a plain support/
+   resistance + structure read derived from fields already on the brief,
+   never a fabricated options premium target (no options pricing data
+   exists anywhere in this engine to base one on). */
+const TREND_ARROW = { rising: "↑", falling: "↓", flat: "↔" };
+
+function deriveChartCell(b) {
+  const s = b.components?.structure;
+  if (!s?.bias) return "No structure data";
+  const event = s.last_event ? s.last_event.replace(/_/g, " ") : "no recent break";
+  return `NIFTY: ${s.bias} (${event})`;
+}
+function deriveOptionChainCell(b) {
+  const o = b.components?.option_snapshot;
+  if (!o || (o.max_call_oi_strike == null && o.max_put_oi_strike == null)) return "No data";
+  return `Max Call ${fmtNum(o.max_call_oi_strike, 0)} / Max Put ${fmtNum(o.max_put_oi_strike, 0)}`;
+}
+function derivePcrCell(b) {
+  const pcr = b.components?.option_snapshot?.pcr;
+  return pcr != null ? fmtNum(pcr, 2) : "No data";
+}
+function deriveParticipantFuturesCell(b) {
+  const p = b.components?.participants;
+  if (!p || !Object.keys(p).length) return "No data";
+  return PARTICIPANT_ORDER.filter((k) => p[k]).map((k) => {
+    const row = p[k];
+    return `${k} ${row.ratio != null ? fmtNum(row.ratio, 1) : "—"}%${TREND_ARROW[row.trend] || ""}`;
+  }).join(" · ");
+}
+function deriveParticipantCashCell(b) {
+  const c = b.components?.fii_dii_cash;
+  if (!c) return "No data";
+  const net = (buy, sell) => (buy != null && sell != null ? buy - sell : null);
+  const fmtNet = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}₹${fmtNum(Math.abs(v), 0)}cr`);
+  return `FII ${fmtNet(net(c.fii_buy, c.fii_sell))} · DII ${fmtNet(net(c.dii_buy, c.dii_sell))}`;
+}
+function deriveGiftCell(b) {
+  const g = b.components?.gift;
+  if (!g || g.price == null) return "No data";
+  const gap = g.gap_pct != null ? ` (${fmtSigned(g.gap_pct)}%)` : "";
+  return `${fmtNum(g.price, 0)}${gap}`;
+}
+function deriveTradesCell(b) {
+  const low = b.expected_low, high = b.expected_high;
+  const bias = b.components?.structure?.bias;
+  if (low == null || high == null) return "No range available";
+  const zone = `${fmtNum(low, 0)}–${fmtNum(high, 0)}`;
+  if (bias === "bullish") return `Watch ${zone}. Hold + bullish structure → lean long.`;
+  if (bias === "bearish") return `Watch ${zone}. Break below with volume → lean short.`;
+  return `Watch ${zone}. No structure edge — wait for a break.`;
+}
+
+const JOURNAL_COLUMNS = [
+  { key: "chart", label: "Chart", render: deriveChartCell },
+  { key: "option_chain", label: "Option Chain", render: deriveOptionChainCell },
+  { key: "pcr", label: "PCR", render: derivePcrCell },
+  { key: "participant_option", label: "Participant Option Data", render: () => "Not tracked" },
+  { key: "participant_futures", label: "Participant Futures Data", render: deriveParticipantFuturesCell },
+  { key: "participant_stock", label: "Participant Stock Data", render: deriveParticipantCashCell },
+  { key: "gift", label: "GIFT Nifty (Overnight)", render: deriveGiftCell },
+  {
+    key: "verdict", label: "Verdict",
+    render: (b) => (
+      <span style={{ color: VERDICT_COLOR[b.verdict] || T.fg, fontWeight: 700 }}>
+        {b.verdict} ({fmtSigned(b.score, 0)})
+      </span>
+    ),
+  },
+  { key: "trades", label: "Trades", render: deriveTradesCell },
+];
+
+function JournalSheet({ history }) {
+  const briefs = history?.briefs || [];
+  return (
+    <Panel title="Pre-market journal (spreadsheet)">
+      {briefs.length === 0 ? (
+        <EmptyNote>No briefs yet.</EmptyNote>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+            <thead>
+              <tr style={{ color: T.muted, textAlign: "left" }}>
+                <th style={{ padding: "6px 10px", fontWeight: 500 }}>Date</th>
+                {JOURNAL_COLUMNS.map((col) => (
+                  <th key={col.key} style={{ padding: "6px 10px", fontWeight: 500, whiteSpace: "nowrap" }}>{col.label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {briefs.map((b) => (
+                <tr key={b.trade_date} style={{ borderTop: `1px solid ${T.line}` }}>
+                  <td style={{ padding: "6px 10px", color: T.fg, fontWeight: 600, whiteSpace: "nowrap" }}>{b.trade_date}</td>
+                  {JOURNAL_COLUMNS.map((col) => (
+                    <td key={col.key} style={{ padding: "6px 10px", color: T.fg, whiteSpace: "nowrap" }}>
+                      {col.render(b)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{ height: 8 }} />
+      <EmptyNote>
+        "Option Chain"/"PCR" fill in once backend.py's PCR tracker persists max call/put OI strike + max pain to pcr_snapshots (not yet). "Participant Option Data" isn't tracked by this engine at all — only futures and cash positioning are, in the columns beside it. "Trades" is a plain support/resistance + structure read, not an options premium target — this engine has no options pricing data to base one on.
+      </EmptyNote>
+    </Panel>
+  );
+}
+
 /* ---------- history table ---------- */
 function HistoryTable({ history }) {
   const briefs = history?.briefs || [];
@@ -471,11 +589,13 @@ export default function App() {
   const [fiiRows, setFiiRows] = useState([]);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState(null);
 
   const loadBrief = useCallback(async () => {
     try {
       const json = await getJSON("/brief/today");
       setBrief(json);
+      setLastUpdated(new Date());
       setErr("");
     } catch (e) {
       setErr(e.message);
@@ -500,14 +620,18 @@ export default function App() {
     })();
   }, [loadBrief, loadHistoryAndTrend]);
 
+  // Live cues (GIFT/US/Asia quotes, macro, positioning — everything on the
+  // brief) refresh every 60s regardless of time of day, not just the
+  // 8:00-9:30 IST window: the brief only actually changes once/day via the
+  // morning job, but a visitor checking GIFT Nifty or US markets in the
+  // evening still wants the page to pick up a fresher read (a manual job
+  // trigger, a delayed cron run, etc.) without a manual reload.
   useEffect(() => {
-    const id = setInterval(() => {
-      if (isPollingWindow(new Date())) loadBrief();
-    }, 60_000);
+    const id = setInterval(loadBrief, 60_000);
     return () => clearInterval(id);
   }, [loadBrief]);
 
-  const live = isPollingWindow(new Date());
+  const inMorningWindow = isPollingWindow(new Date());
 
   return (
     <div style={{ minHeight: "100%", background: T.ink, fontFamily: DISP }}>
@@ -516,7 +640,12 @@ export default function App() {
           <div style={{ fontSize: 20, fontWeight: 700, color: T.fg }}>Nifty Pre-Market Brief</div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             {loading && <span style={{ fontSize: 12, color: T.muted }}>Loading…</span>}
-            <Chip color={live ? T.put : T.muted}>{live ? "● Live polling" : "Static"}</Chip>
+            {lastUpdated && (
+              <span style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>
+                Updated {lastUpdated.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST
+              </span>
+            )}
+            <Chip color={T.put}>● Auto-refreshing (60s){inMorningWindow ? " · pre-open" : ""}</Chip>
             <a href="./index.html"
               style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, textDecoration: "none", fontFamily: DISP }}>
               ← PCR Session Clock
@@ -538,6 +667,9 @@ export default function App() {
           <ParticipantPanel brief={brief} />
           <EventsNewsPanel brief={brief} />
           <LevelsPanel brief={brief} />
+          <div style={{ gridColumn: "1 / -1" }}>
+            <JournalSheet history={history} />
+          </div>
           <div style={{ gridColumn: "1 / -1" }}>
             <HistoryTable history={history} />
           </div>
