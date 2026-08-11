@@ -438,17 +438,21 @@ function liveFigures(trade, chainByStrike) {
   return { invested, currentLtp, currentValue: currentLtp * trade.lot_size * trade.lots, pnl, isLive: true };
 }
 
-async function fetchChainMap() {
+async function fetchChain() {
   try {
     const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
-    if (!res.ok) return {};
+    if (!res.ok) return { spot: null, rows: [] };
     const json = await res.json();
-    const chain = {};
-    (json.rows || []).forEach((r) => { chain[Number(r.strike)] = r; });
-    return chain;
+    return { spot: json.spot ?? null, rows: json.rows || [] };
   } catch {
-    return {}; // background tick -- not worth surfacing an error banner for
+    return { spot: null, rows: [] }; // background tick -- not worth surfacing an error banner for
   }
+}
+
+function chainMapFromRows(rows) {
+  const map = {};
+  rows.forEach((r) => { map[Number(r.strike)] = r; });
+  return map;
 }
 
 // Ticks its own clock every second (broker-platform-style live elapsed
@@ -475,6 +479,8 @@ function PaperTradingPanel() {
   const [trades, setTrades] = useState([]);
   const [summary, setSummary] = useState(null);
   const [weekly, setWeekly] = useState([]);
+  const [chainRows, setChainRows] = useState([]);
+  const [chainSpot, setChainSpot] = useState(null);
   const [chainByStrike, setChainByStrike] = useState({});
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
@@ -487,11 +493,13 @@ function PaperTradingPanel() {
 
   const load = useCallback(async () => {
     try {
-      const [json, chain] = await Promise.all([getJSON("/paper-trades?days=90"), fetchChainMap()]);
+      const [json, chain] = await Promise.all([getJSON("/paper-trades?days=90"), fetchChain()]);
       setTrades(json.trades || []);
       setSummary(json.summary || null);
       setWeekly(json.weekly || []);
-      setChainByStrike(chain);
+      setChainRows(chain.rows);
+      setChainSpot(chain.spot);
+      setChainByStrike(chainMapFromRows(chain.rows));
       setErr("");
     } catch (e) {
       setErr(e.message);
@@ -504,18 +512,25 @@ function PaperTradingPanel() {
 
   const openTrades = trades.filter((t) => t.status === "open");
 
-  // Live PnL, broker-platform-style: re-pull just the option chain (not the
-  // whole trades list) every 5s while any trade is open, so unrealized PnL
-  // updates on its own without a manual refresh. 5s, not 1s, because the
-  // underlying NSE data itself is CDN-cached on ~10-15s cycles upstream
-  // (see backend.py) -- polling faster would just re-fetch the same
-  // numbers. Paused entirely once nothing is open, so it isn't running
-  // forever in a background tab for no reason.
+  // Live option chain + PnL, broker-platform-style: re-pull just the chain
+  // (not the whole trades list) every 5s, so both the browsable CE/PE
+  // chain below and any open trade's unrealized PnL update on their own.
+  // 5s, not 1s: the underlying NSE data is itself CDN-cached on ~10-15s
+  // cycles upstream (see backend.py), so polling faster would just
+  // re-fetch identical numbers.
   useEffect(() => {
-    if (openTrades.length === 0) return;
-    const id = setInterval(async () => setChainByStrike(await fetchChainMap()), 5000);
+    const id = setInterval(async () => {
+      const chain = await fetchChain();
+      setChainRows(chain.rows);
+      setChainSpot(chain.spot);
+      setChainByStrike(chainMapFromRows(chain.rows));
+    }, 5000);
     return () => clearInterval(id);
-  }, [openTrades.length]);
+  }, []);
+
+  const selectStrike = (strike, optionType, ltp) => {
+    setForm((f) => ({ ...f, strike: String(strike), optionType, entryPrice: ltp != null ? String(ltp) : f.entryPrice }));
+  };
 
   const unrealizedTotal = openTrades.reduce((sum, t) => {
     const { pnl, isLive } = liveFigures(t, chainByStrike);
@@ -662,6 +677,59 @@ function PaperTradingPanel() {
           {submitting ? "Adding…" : "Add trade"}
         </button>
       </form>
+
+      {chainRows.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6, flexWrap: "wrap", gap: 6 }}>
+            <div style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6 }}>
+              Live NIFTY option chain
+              {chainSpot != null && (
+                <span style={{ color: T.fg, textTransform: "none", fontWeight: 400 }}> · spot {fmtNum(chainSpot, 1)}</span>
+              )}
+            </div>
+            <span style={{ fontFamily: DISP, fontSize: 10, color: T.muted }}>Click a CE/PE premium to fill the form</span>
+          </div>
+          <div style={{ overflow: "auto", maxHeight: 240, border: `1px solid ${T.line}`, borderRadius: 8 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+              <thead>
+                <tr style={{ color: T.muted, textAlign: "left" }}>
+                  <th style={{ ...tradeThStyle, position: "sticky", top: 0, background: T.panel }}>CE OI</th>
+                  <th style={{ ...tradeThStyle, position: "sticky", top: 0, background: T.panel, color: T.call }}>CE LTP</th>
+                  <th style={{ ...tradeThStyle, position: "sticky", top: 0, background: T.panel, textAlign: "center" }}>Strike</th>
+                  <th style={{ ...tradeThStyle, position: "sticky", top: 0, background: T.panel, color: T.put }}>PE LTP</th>
+                  <th style={{ ...tradeThStyle, position: "sticky", top: 0, background: T.panel }}>PE OI</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...chainRows].sort((a, b) => a.strike - b.strike).map((r) => {
+                  const isAtm = chainSpot != null && Math.abs(r.strike - chainSpot) <= 25;
+                  return (
+                    <tr key={r.strike} style={{ borderTop: `1px solid ${T.line}`, background: isAtm ? `${T.cyan}14` : "transparent" }}>
+                      <td style={tradeTdStyle}>{fmtNum(r.ceOi, 0)}</td>
+                      <td
+                        style={{ ...tradeTdStyle, color: T.call, cursor: r.ceLtp != null ? "pointer" : "default", fontWeight: 700 }}
+                        onClick={() => r.ceLtp != null && selectStrike(r.strike, "CE", r.ceLtp)}
+                        title={r.ceLtp != null ? "Use this strike/premium for a CE trade" : undefined}
+                      >
+                        {r.ceLtp != null ? fmtNum(r.ceLtp, 2) : "—"}
+                      </td>
+                      <td style={{ ...tradeTdStyle, textAlign: "center", fontWeight: 700, color: isAtm ? T.cyan : T.fg }}>{fmtNum(r.strike, 0)}</td>
+                      <td
+                        style={{ ...tradeTdStyle, color: T.put, cursor: r.peLtp != null ? "pointer" : "default", fontWeight: 700 }}
+                        onClick={() => r.peLtp != null && selectStrike(r.strike, "PE", r.peLtp)}
+                        title={r.peLtp != null ? "Use this strike/premium for a PE trade" : undefined}
+                      >
+                        {r.peLtp != null ? fmtNum(r.peLtp, 2) : "—"}
+                      </td>
+                      <td style={tradeTdStyle}>{fmtNum(r.peOi, 0)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {err && (
         <div style={{ marginBottom: 12, padding: "8px 12px", background: `${T.call}18`, border: `1px solid ${T.call}55`, borderRadius: 8, color: T.call, fontSize: 12 }}>
