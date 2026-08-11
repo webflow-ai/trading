@@ -114,10 +114,70 @@ uses the service-role key, which bypasses RLS). No RLS policies were added
 (intentionally — nothing but the service-role key should touch these
 tables).
 
-Vercel env vars are **not yet set** — the Vercel MCP server connected has no
-env-var read/write tool (by design, to avoid exposing secrets), so this
-still needs to happen by hand in the dashboard. See the chat for the exact
-list and where each value comes from.
+Vercel env vars: `SUPABASE_URL`/`SUPABASE_SERVICE_KEY`/`PREMARKET_JOB_API_KEY`
+confirmed set and working (verified live, see below). The rest
+(`TELEGRAM_*`, `GEMINI_API_KEY`, `CORS_ORIGIN`) not independently confirmed
+here — the Vercel MCP server has no env-var read tool by design, so
+"working" was only ever established indirectly, by hitting the deployed
+endpoints and seeing correct behavior.
+
+## Operational incident: cron never fired, then the morning job was too slow (2026-08-11)
+
+**Symptom reported:** "the evening job is not working, prices/news aren't
+updating." Root causes turned out to be two unrelated things, found via the
+Vercel MCP server's runtime-log/error tools plus GitHub's public Actions
+API (deployment and workflow-run history — no `gh` CLI or token available
+in this environment, so raw `curl` against `api.github.com`):
+
+1. **GitHub Actions cron auth.** The very first real scheduled run (evening
+   slot) failed at the `curl` step — `vars.PREMARKET_BASE_URL` and
+   `secrets.PREMARKET_JOB_API_KEY` both resolved to **empty strings** in the
+   workflow log (`-H "X-API-Key: "`, a URL with no host — GitHub masks real
+   secret values as `***`, so an empty one just prints blank). Despite being
+   told "both are set," something about how they were configured (wrong
+   tab, environment-scoped instead of repo-level, a name typo) meant the
+   workflow couldn't see them. Fixed by generating a brand new
+   `PREMARKET_JOB_API_KEY` and having the user set that exact value in both
+   Vercel and GitHub Actions secrets fresh, then verifying directly with
+   `curl` against the production endpoint (`401` on a wrong key, `200` on
+   the right one) rather than trusting either dashboard's "saved" state.
+2. **Morning job latency, ~27s end to end**, enough to intermittently hit
+   Vercel's function timeout and return a bare 500 — which is what actually
+   broke "prices/news not updating" even after (1) was fixed. Diagnosed by
+   adding `time.monotonic()` checkpoints around each phase (still in
+   `jobs.py`/`news_ai.py`, left in — cheap, and useful if this regresses)
+   and redeploying between each measurement:
+   - Quotes/GIFT/levels/structure (~14 independent Yahoo/GIFT calls) were
+     awaited one at a time — 1.3s once parallelized via `asyncio.gather`
+     (was contributing several seconds).
+   - `google-generativeai` (the SDK, not the API itself) turned out to
+     reinstall its ~50MB dependency tree from scratch on every cold Vercel
+     invocation (`grpcio`, `google-api-python-client`, `cryptography`, ...)
+     for what is fundamentally one JSON-in/JSON-out HTTP call. Replaced with
+     a raw `httpx` POST to Gemini's REST API, matching every other
+     integration in this codebase — dependency removed entirely.
+   - The real remainder, ~17.5s, was the Gemini call itself — confirmed via
+     the phase timing, not assumed. Fixed by cutting `MAX_HEADLINES` 25→12
+     (only `TOP_NEWS_COUNT`=4 are ever shown, so classifying 25 with full
+     reasoning was mostly wasted generation) and running the whole
+     RSS-fetch-plus-Gemini-classify step as a background `asyncio.create_task`
+     kicked off at the very start of the job, overlapping it with the
+     quotes/positioning work instead of stacking after it.
+   - **Two attempted further fixes both failed live and were reverted**,
+     worth remembering before trying either again: `generationConfig.
+     maxOutputTokens: 1024` made things *worse* — this model spends part of
+     its budget on hidden "thinking" tokens before the visible answer, and
+     1024 was consumed by that alone, producing an empty/truncated response
+     that failed to parse (silently fell back to neutral every time, fast
+     but wrong). `thinkingConfig.thinkingBudget: 0` to disable thinking
+     outright is **not a supported field on this model/API version** — flat
+     `400 Bad Request`, also silently falling back to neutral. Both
+     reverted; `MAX_HEADLINES` + the background-task overlap are the only
+     verified-safe latency levers found so far.
+   - **End state, live-verified over several consecutive runs:** 27s → 11s,
+     `HTTP 200`, real classified headlines (not the neutral fallback), both
+     jobs (`POST /api/premarket/jobs/evening` and `/morning`) confirmed
+     working end-to-end against production.
 
 Progress against the build order:
 
