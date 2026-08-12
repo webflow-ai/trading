@@ -128,6 +128,20 @@ def test_upstox_optionchain_non_200_reports_error_without_crashing(monkeypatch):
     assert "500" in body["error"]
 
 
+def test_upstox_optionchain_normalizes_explicitly_passed_nse_format_expiry(monkeypatch):
+    monkeypatch.setattr(index_module, "upstox_token", {"access_token": "tok123", "obtained_at": "now"})
+
+    fake_response = FakeUpstoxResponse(200, {"data": []})
+    fake_client = FakeUpstoxAsyncClient(fake_response)
+    monkeypatch.setattr(index_module.httpx, "AsyncClient", lambda **kw: fake_client)
+
+    r = client.get("/api/upstox/optionchain", params={"symbol": "NIFTY", "expiry": "18-Aug-2026"})
+    body = r.json()
+    assert body["expiry"] == "2026-08-18"
+    # confirms Upstox itself was called with the normalized ISO date, not the raw NSE string
+    assert fake_client.calls[0][1]["params"]["expiry_date"] == "2026-08-18"
+
+
 def test_nse_expiry_to_iso_converts_format():
     assert index_module._nse_expiry_to_iso("18-Aug-2026") == "2026-08-18"
 

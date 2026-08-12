@@ -461,9 +461,14 @@ async def upstox_optionchain(symbol: str = Query("NIFTY"), expiry: str = Query(N
 
     if not expiry:
         try:
-            expiry = _nse_expiry_to_iso(await get_nearest_expiry(symbol))
+            expiry = await get_nearest_expiry(symbol)
         except Exception as e:
             return {"connected": True, "spot": None, "rows": [], "error": f"couldn't resolve nearest expiry: {e}"}
+    # Callers (the main PCR tracker's OptionChain panel included) pass
+    # through whatever /api/expiries gave them, which is NSE's own
+    # '18-Aug-2026' format -- normalize unconditionally so an explicitly
+    # passed expiry works too, not just the internally-resolved default.
+    expiry = _nse_expiry_to_iso(expiry)
 
     try:
         async with httpx.AsyncClient(timeout=10) as up_client:

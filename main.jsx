@@ -1278,9 +1278,22 @@ function OptionChainSheet({ backendUrl, symbol, strikes, onClose }) {
 }
 
 /* ---------- option chain: panel ---------- */
+// Nearest-to-spot N rows from a full chain -- Upstox's option-chain API
+// always returns every strike (unlike /api/optionchain/today's own n=
+// param), so this reproduces the "top N near spot" trim client-side when
+// Upstox is the source, keeping the panel's behavior identical either way.
+function nearestRows(rows, spot, n) {
+  if (spot == null) return rows.slice(0, n);
+  return [...rows]
+    .sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot))
+    .slice(0, n)
+    .sort((a, b) => a.strike - b.strike);
+}
+
 function OptionChain({ backendUrl, symbol }) {
   const [chain, setChain] = useState(null);
   const [chainErr, setChainErr] = useState("");
+  const [chainSource, setChainSource] = useState(null); // "upstox" | "nse" | null
   const [expiries, setExpiries] = useState([]);
   const [selectedExpiry, setSelectedExpiry] = useState("");
   const [selectedStrike, setSelectedStrike] = useState(null);
@@ -1303,14 +1316,39 @@ function OptionChain({ backendUrl, symbol }) {
 
   const load = useCallback(async () => {
     if (!backendUrl) { setChainErr("No backend connected"); return; }
+    const base = backendUrl.replace(/\/$/, "");
+
+    // Prefer Upstox (real broker LTPs, connected via /api/upstox/login) --
+    // falls back to the NSE-scrape-backed /api/optionchain/today whenever
+    // Upstox isn't connected or errors, so this panel still works either way.
     try {
-      const base = backendUrl.replace(/\/$/, "");
+      const uq = new URLSearchParams({ symbol });
+      if (selectedExpiry) uq.set("expiry", selectedExpiry);
+      const ures = await fetch(`${base}/api/upstox/optionchain?${uq.toString()}`);
+      if (ures.ok) {
+        const ujson = await ures.json();
+        if (ujson.connected && (ujson.rows || []).length > 0) {
+          setChain({
+            symbol: ujson.symbol, expiry: ujson.expiry, spot: ujson.spot,
+            rows: nearestRows(ujson.rows, ujson.spot, 10),
+          });
+          setChainSource("upstox");
+          setChainErr("");
+          return;
+        }
+      }
+    } catch {
+      // fall through to the NSE fallback below
+    }
+
+    try {
       const qs = new URLSearchParams({ symbol, n: "10" });
       if (selectedExpiry) qs.set("expiry", selectedExpiry);
       const res = await fetch(`${base}/api/optionchain/today?${qs.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       setChain(json);
+      setChainSource("nse");
       setChainErr(json.rows && json.rows.length ? "" : "Backend has no chain data yet");
     } catch (e) {
       setChainErr(e.message);
@@ -1347,6 +1385,16 @@ function OptionChain({ backendUrl, symbol }) {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: MONO, fontSize: 11 }}>
           {chain?.spot != null && <span style={{ color: T.muted }}>Spot {fmt(chain.spot, 2)}</span>}
+          {chainSource && (
+            <span
+              style={{ color: chainSource === "upstox" ? T.cyan : T.amber, fontWeight: 600 }}
+              title={chainSource === "upstox"
+                ? "Live via your connected Upstox account"
+                : "Upstox not connected — falling back to the NSE-derived feed. Visit /api/upstox/login to connect Upstox."}
+            >
+              via {chainSource === "upstox" ? "Upstox" : "NSE fallback"}
+            </span>
+          )}
           <Pill color={rows.length ? T.put : T.call} dot={!!rows.length}>{rows.length ? "Live" : "No data"}</Pill>
           <button onClick={() => setShowSheet((s) => !s)} title="Show every strike's 5-min PCR history as a sheet"
             style={{
