@@ -72,8 +72,8 @@ def test_upstox_optionchain_parses_rows_when_connected(monkeypatch):
             {
                 "strike_price": 24500,
                 "underlying_spot_price": 24471.7,
-                "call_options": {"market_data": {"ltp": 71.55, "oi": 97312, "volume": 500, "oi_change": 10}},
-                "put_options": {"market_data": {"ltp": 28.25, "oi": 167612, "volume": 300, "oi_change": -5}},
+                "call_options": {"market_data": {"ltp": 71.55, "oi": 97312, "volume": 500, "prev_oi": 97302}},
+                "put_options": {"market_data": {"ltp": 28.25, "oi": 167612, "volume": 300, "prev_oi": 167617}},
             },
         ],
     })
@@ -91,8 +91,10 @@ def test_upstox_optionchain_parses_rows_when_connected(monkeypatch):
     assert row["strike"] == 24500
     assert row["ceLtp"] == 71.55
     assert row["ceOi"] == 97312
+    assert row["ceOiChg"] == 10  # oi (97312) minus prev_oi (97302), not a direct field from Upstox
     assert row["peLtp"] == 28.25
     assert row["peOi"] == 167612
+    assert row["peOiChg"] == -5  # 167612 - 167617
     # confirms the Bearer token from upstox_token actually made it onto the request
     assert fake_client.calls[0][1]["headers"]["Authorization"] == "Bearer tok123"
 

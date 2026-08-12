@@ -32,6 +32,7 @@ async def open_trade(
     *, strike: float, option_type: str, action: str, entry_price: float,
     lots: int = 1, lot_size: int = DEFAULT_LOT_SIZE, symbol: str = "NIFTY",
     trade_date: str | None = None, notes: str | None = None,
+    stop_loss: float | None = None, target_price: float | None = None,
 ) -> dict:
     trade_date = trade_date or dt.datetime.now(IST).date().isoformat()
     row = {
@@ -46,13 +47,18 @@ async def open_trade(
         "entry_time": dt.datetime.now(IST).isoformat(),
         "status": "open",
         "notes": notes,
+        "stop_loss": stop_loss,
+        "target_price": target_price,
     }
     return await storage.create_paper_trade(row)
 
 
-async def close_trade(trade_id: int, exit_price: float) -> dict | None:
+async def close_trade(trade_id: int, exit_price: float, reason: str = "manual") -> dict | None:
     """None if the trade doesn't exist or is already closed (closing twice
-    would silently overwrite a real exit with a second one otherwise)."""
+    would silently overwrite a real exit with a second one otherwise).
+    `reason` distinguishes a manual close from an automatic one triggered by
+    stop_loss/target_price being crossed (see premarket.jsx's live-price
+    polling loop, which is what actually watches for and calls this)."""
     trade = await storage.get_paper_trade(trade_id)
     if not trade or trade.get("status") != "open":
         return None
@@ -65,6 +71,7 @@ async def close_trade(trade_id: int, exit_price: float) -> dict | None:
         "exit_price": exit_price,
         "exit_time": dt.datetime.now(IST).isoformat(),
         "pnl": pnl,
+        "exit_reason": reason,
     }
     return await storage.update_paper_trade(trade_id, patch)
 

@@ -163,10 +163,29 @@ def test_create_paper_trade_endpoint_rejects_bad_action():
     assert r.status_code == 400
 
 
+def test_create_paper_trade_endpoint_passes_through_stop_loss_and_target(monkeypatch):
+    captured = {}
+
+    async def fake_open_trade(**kwargs):
+        captured.update(kwargs)
+        return {"id": 1, "status": "open", **kwargs}
+
+    monkeypatch.setattr(main_module.paper_trading, "open_trade", fake_open_trade)
+
+    r = client.post("/api/premarket/paper-trades", json={
+        "strike": 24500, "option_type": "CE", "action": "BUY", "entry_price": 120.5,
+        "stop_loss": 90.0, "target_price": 160.0,
+    })
+    assert r.status_code == 200
+    assert captured["stop_loss"] == 90.0
+    assert captured["target_price"] == 160.0
+
+
 def test_close_paper_trade_endpoint_success(monkeypatch):
-    async def fake_close_trade(trade_id, exit_price):
+    async def fake_close_trade(trade_id, exit_price, reason="manual"):
         assert trade_id == 7
         assert exit_price == 125.0
+        assert reason == "manual"
         return {"id": 7, "status": "closed", "pnl": 1875.0}
 
     monkeypatch.setattr(main_module.paper_trading, "close_trade", fake_close_trade)
@@ -181,8 +200,27 @@ def test_close_paper_trade_endpoint_requires_exit_price():
     assert r.status_code == 400
 
 
+def test_close_paper_trade_endpoint_rejects_bad_reason():
+    r = client.post("/api/premarket/paper-trades/7/close", json={"exit_price": 100, "reason": "vibes"})
+    assert r.status_code == 400
+
+
+def test_close_paper_trade_endpoint_passes_through_stop_loss_reason(monkeypatch):
+    captured = {}
+
+    async def fake_close_trade(trade_id, exit_price, reason="manual"):
+        captured["reason"] = reason
+        return {"id": trade_id, "status": "closed", "pnl": -500.0, "exit_reason": reason}
+
+    monkeypatch.setattr(main_module.paper_trading, "close_trade", fake_close_trade)
+
+    r = client.post("/api/premarket/paper-trades/7/close", json={"exit_price": 90.0, "reason": "stop_loss"})
+    assert r.status_code == 200
+    assert captured["reason"] == "stop_loss"
+
+
 def test_close_paper_trade_endpoint_404_when_not_found(monkeypatch):
-    async def fake_close_trade(trade_id, exit_price):
+    async def fake_close_trade(trade_id, exit_price, reason="manual"):
         return None
 
     monkeypatch.setattr(main_module.paper_trading, "close_trade", fake_close_trade)

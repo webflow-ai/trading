@@ -53,6 +53,8 @@ def test_open_trade_builds_correct_row_and_persists(monkeypatch):
     assert captured["status"] == "open"
     assert captured["notes"] == "test entry"
     assert captured["entry_time"] is not None
+    assert captured["stop_loss"] is None
+    assert captured["target_price"] is None
 
 
 def test_open_trade_defaults_trade_date_to_today_ist(monkeypatch):
@@ -69,6 +71,24 @@ def test_open_trade_defaults_trade_date_to_today_ist(monkeypatch):
     assert captured["trade_date"] is not None
     assert captured["lot_size"] == paper_trading.DEFAULT_LOT_SIZE
     assert captured["lots"] == 1
+
+
+def test_open_trade_carries_stop_loss_and_target_price(monkeypatch):
+    captured = {}
+
+    async def fake_create_paper_trade(row):
+        captured.update(row)
+        return row
+
+    monkeypatch.setattr(paper_trading.storage, "create_paper_trade", fake_create_paper_trade)
+
+    asyncio.run(paper_trading.open_trade(
+        strike=24500, option_type="CE", action="BUY", entry_price=120.5,
+        stop_loss=90.0, target_price=160.0,
+    ))
+
+    assert captured["stop_loss"] == 90.0
+    assert captured["target_price"] == 160.0
 
 
 def test_close_trade_computes_pnl_and_patches(monkeypatch):
@@ -92,6 +112,25 @@ def test_close_trade_computes_pnl_and_patches(monkeypatch):
     assert captured_patch["exit_price"] == 125.0
     assert captured_patch["pnl"] == 1875.0
     assert captured_patch["exit_time"] is not None
+    assert captured_patch["exit_reason"] == "manual"
+
+
+def test_close_trade_records_stop_loss_reason(monkeypatch):
+    async def fake_get_paper_trade(trade_id):
+        return {"id": 7, "action": "BUY", "entry_price": 100.0, "lot_size": 75, "lots": 1, "status": "open"}
+
+    captured_patch = {}
+
+    async def fake_update_paper_trade(trade_id, patch):
+        captured_patch.update(patch)
+        return {"id": trade_id, **patch}
+
+    monkeypatch.setattr(paper_trading.storage, "get_paper_trade", fake_get_paper_trade)
+    monkeypatch.setattr(paper_trading.storage, "update_paper_trade", fake_update_paper_trade)
+
+    asyncio.run(paper_trading.close_trade(7, exit_price=90.0, reason="stop_loss"))
+
+    assert captured_patch["exit_reason"] == "stop_loss"
 
 
 def test_close_trade_returns_none_when_trade_not_found(monkeypatch):

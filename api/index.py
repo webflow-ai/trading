@@ -489,6 +489,12 @@ async def upstox_optionchain(symbol: str = Query("NIFTY"), expiry: str = Query(N
     except Exception as e:
         return {"connected": True, "spot": None, "rows": [], "error": f"upstox returned non-JSON: {e}"}
 
+    def _oi_change(md: dict):
+        # Upstox's market_data has no direct "change" field -- oi minus
+        # prev_oi is the actual change, confirmed against a real response.
+        oi, prev_oi = md.get("oi"), md.get("prev_oi")
+        return (oi - prev_oi) if oi is not None and prev_oi is not None else None
+
     data = payload.get("data") or []
     spot = None
     rows = []
@@ -500,11 +506,11 @@ async def upstox_optionchain(symbol: str = Query("NIFTY"), expiry: str = Query(N
         rows.append({
             "strike": item.get("strike_price"),
             "ceOi": call_md.get("oi"),
-            "ceOiChg": call_md.get("oi_change") or call_md.get("oi_day_change"),
+            "ceOiChg": _oi_change(call_md),
             "ceVol": call_md.get("volume"),
             "ceLtp": call_md.get("ltp"),
             "peOi": put_md.get("oi"),
-            "peOiChg": put_md.get("oi_change") or put_md.get("oi_day_change"),
+            "peOiChg": _oi_change(put_md),
             "peVol": put_md.get("volume"),
             "peLtp": put_md.get("ltp"),
         })

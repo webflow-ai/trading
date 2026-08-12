@@ -149,6 +149,8 @@ async def create_paper_trade_endpoint(payload: dict):
         lot_size=payload.get("lot_size", paper_trading.DEFAULT_LOT_SIZE),
         symbol=payload.get("symbol", "NIFTY"),
         notes=payload.get("notes"),
+        stop_loss=payload.get("stop_loss"),
+        target_price=payload.get("target_price"),
     )
     return trade
 
@@ -158,7 +160,10 @@ async def close_paper_trade_endpoint(trade_id: int, payload: dict):
     exit_price = payload.get("exit_price")
     if exit_price is None:
         raise HTTPException(400, "exit_price required")
-    trade = await paper_trading.close_trade(trade_id, exit_price)
+    reason = payload.get("reason", "manual")
+    if reason not in ("manual", "stop_loss", "target"):
+        raise HTTPException(400, "reason must be 'manual', 'stop_loss', or 'target'")
+    trade = await paper_trading.close_trade(trade_id, exit_price, reason=reason)
     if not trade:
         raise HTTPException(404, "trade not found, or already closed")
     return trade
