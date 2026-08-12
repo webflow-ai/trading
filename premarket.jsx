@@ -440,6 +440,26 @@ function liveFigures(trade, chainByStrike) {
   return { invested, currentLtp, currentValue: currentLtp * trade.lot_size * trade.lots, pnl, isLive: true };
 }
 
+// Returns "stop_loss" | "target" | null. For a BUY, stop_loss sits below
+// entry (triggers if price falls to/through it) and target sits above
+// (triggers if price rises to/through it); for a SELL (writing/shorting)
+// it's the mirror image, matching compute_pnl's sign convention elsewhere.
+// Checked >= /<= (not ==) since the polled LTP can jump past the exact
+// trigger between ticks rather than landing on it precisely.
+function checkStopTarget(trade, currentLtp) {
+  if (currentLtp == null) return null;
+  const isBuy = trade.action === "BUY";
+  if (trade.stop_loss != null) {
+    const hit = isBuy ? currentLtp <= trade.stop_loss : currentLtp >= trade.stop_loss;
+    if (hit) return "stop_loss";
+  }
+  if (trade.target_price != null) {
+    const hit = isBuy ? currentLtp >= trade.target_price : currentLtp <= trade.target_price;
+    if (hit) return "target";
+  }
+  return null;
+}
+
 // Prefers Upstox (real broker LTPs, connected via /api/upstox/login) for
 // the second-by-second feed; falls back to the NSE-scrape-backed
 // /api/optionchain/today (same one "Fetch live" already used) whenever
@@ -505,8 +525,11 @@ function PaperTradingPanel() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [form, setForm] = useState({
-    strike: "", optionType: "CE", action: "BUY", lots: 1, lotSize: DEFAULT_LOT_SIZE_FALLBACK, entryPrice: "", notes: "",
+    strike: "", optionType: "CE", action: "BUY", lots: 1, lotSize: DEFAULT_LOT_SIZE_FALLBACK, entryPrice: "",
+    stopLoss: "", targetPrice: "", notes: "",
   });
+  const tradesRef = useRef([]); // mirrors `trades` for the 1s poll effect below, which can't take trades as a dep without recreating the interval on every load()
+  const autoClosingRef = useRef(new Set()); // trade ids currently being auto-closed, so a hit isn't re-submitted on the next tick before the server confirms
   const [fetchingLtp, setFetchingLtp] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [closingDrafts, setClosingDrafts] = useState({});
@@ -530,32 +553,57 @@ function PaperTradingPanel() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { tradesRef.current = trades; }, [trades]);
 
   const openTrades = trades.filter((t) => t.status === "open");
 
-  // Live option chain + PnL, broker-platform-style: re-pull just the chain
-  // (not the whole trades list) every 1s. Upstox (when connected) genuinely
-  // updates that fast; the NSE fallback is itself CDN-cached on ~10-15s
-  // cycles upstream (see backend.py) so it'll often just re-serve the same
-  // numbers between ticks -- harmless, not worth a separate slower interval
-  // for the fallback case. The in-flight guard skips a tick if the previous
-  // fetch hasn't finished yet, so a slow response can't pile up requests.
+  // Live option chain + PnL + stop-loss/target auto-execution, broker-
+  // platform-style: re-pull just the chain (not the whole trades list)
+  // every 1s. Upstox (when connected) genuinely updates that fast; the NSE
+  // fallback is itself CDN-cached on ~10-15s cycles upstream (see
+  // backend.py) so it'll often just re-serve the same numbers between
+  // ticks -- harmless, not worth a separate slower interval for the
+  // fallback case. The in-flight guard skips a tick if the previous fetch
+  // hasn't finished yet, so a slow response can't pile up requests.
+  //
+  // Auto-execution only fires while this panel is mounted and polling --
+  // there's no server-side scheduler in this serverless deployment to
+  // watch prices when the page isn't open, so a stop-loss/target set here
+  // is a live watch, not a standing broker-side order. autoClosingRef
+  // guards against re-submitting the same hit on the next tick before the
+  // server confirms the close and a fresh load() marks the trade closed.
   useEffect(() => {
     const id = setInterval(async () => {
       if (chainFetchInFlight.current) return;
       chainFetchInFlight.current = true;
       try {
         const chain = await fetchChain();
+        const freshMap = chainMapFromRows(chain.rows);
         setChainRows(chain.rows);
         setChainSpot(chain.spot);
-        setChainByStrike(chainMapFromRows(chain.rows));
+        setChainByStrike(freshMap);
         setChainSource(chain.source);
+
+        for (const t of tradesRef.current) {
+          if (t.status !== "open" || autoClosingRef.current.has(t.id)) continue;
+          const row = freshMap[Number(t.strike)];
+          const ltp = row ? (t.option_type === "CE" ? row.ceLtp : row.peLtp) : null;
+          const reason = checkStopTarget(t, ltp);
+          if (!reason) continue;
+          autoClosingRef.current.add(t.id);
+          try {
+            await postJSON(`/paper-trades/${t.id}/close`, { exit_price: ltp, reason });
+            await load();
+          } finally {
+            autoClosingRef.current.delete(t.id);
+          }
+        }
       } finally {
         chainFetchInFlight.current = false;
       }
     }, 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [load]);
 
   const selectStrike = (strike, optionType, ltp) => {
     setForm((f) => ({ ...f, strike: String(strike), optionType, entryPrice: ltp != null ? String(ltp) : f.entryPrice }));
@@ -612,9 +660,11 @@ function PaperTradingPanel() {
         entry_price: Number(form.entryPrice),
         lots: Number(form.lots) || 1,
         lot_size: Number(form.lotSize) || DEFAULT_LOT_SIZE_FALLBACK,
+        stop_loss: form.stopLoss ? Number(form.stopLoss) : null,
+        target_price: form.targetPrice ? Number(form.targetPrice) : null,
         notes: form.notes || null,
       });
-      setForm((f) => ({ ...f, strike: "", entryPrice: "", notes: "" }));
+      setForm((f) => ({ ...f, strike: "", entryPrice: "", stopLoss: "", targetPrice: "", notes: "" }));
       setErr("");
       await load();
     } catch (e) {
@@ -697,6 +747,16 @@ function PaperTradingPanel() {
         <button type="button" onClick={fetchLivePremium} disabled={!form.strike || fetchingLtp} style={formButtonStyle(false, !form.strike || fetchingLtp)}>
           {fetchingLtp ? "Fetching…" : "Fetch live"}
         </button>
+        <div style={{ width: 100 }}>
+          <label style={formLabelStyle} title="Auto-closes the trade if the live premium reaches this (watched while this page is open — not a standing broker order)">Stop-loss</label>
+          <input type="number" step="0.05" value={form.stopLoss} placeholder="optional"
+            onChange={(e) => setForm((f) => ({ ...f, stopLoss: e.target.value }))} style={formInputStyle} />
+        </div>
+        <div style={{ width: 100 }}>
+          <label style={formLabelStyle} title="Auto-closes the trade if the live premium reaches this (watched while this page is open — not a standing broker order)">Target</label>
+          <input type="number" step="0.05" value={form.targetPrice} placeholder="optional"
+            onChange={(e) => setForm((f) => ({ ...f, targetPrice: e.target.value }))} style={formInputStyle} />
+        </div>
         <div style={{ flex: 1, minWidth: 140 }}>
           <label style={formLabelStyle}>Notes (optional)</label>
           <input type="text" value={form.notes} placeholder="why this trade"
@@ -794,6 +854,7 @@ function PaperTradingPanel() {
                 <th style={tradeThStyle}>Action</th>
                 <th style={tradeThStyle}>Lots</th>
                 <th style={tradeThStyle}>Entry</th>
+                <th style={tradeThStyle} title="Auto-close levels, watched while this page is open">SL / Target</th>
                 <th style={tradeThStyle}>Invested</th>
                 <th style={tradeThStyle}>LTP / Exit</th>
                 <th style={tradeThStyle}>Value</th>
@@ -821,6 +882,11 @@ function PaperTradingPanel() {
                     <td style={tradeTdStyle}>{t.action}</td>
                     <td style={tradeTdStyle}>{t.lots}</td>
                     <td style={tradeTdStyle}>{fmtNum(t.entry_price, 2)}</td>
+                    <td style={tradeTdStyle}>
+                      {t.stop_loss != null && <div style={{ color: T.call }}>SL {fmtNum(t.stop_loss, 2)}</div>}
+                      {t.target_price != null && <div style={{ color: T.put }}>Tgt {fmtNum(t.target_price, 2)}</div>}
+                      {t.stop_loss == null && t.target_price == null && "—"}
+                    </td>
                     <td style={tradeTdStyle}>{fmtNum(invested, 0)}</td>
                     <td style={tradeTdStyle}>
                       {isOpen
@@ -845,7 +911,9 @@ function PaperTradingPanel() {
                           </button>
                         </div>
                       ) : (
-                        <Chip color={T.muted}>closed</Chip>
+                        <Chip color={t.exit_reason === "stop_loss" ? T.call : t.exit_reason === "target" ? T.put : T.muted}>
+                          {t.exit_reason === "stop_loss" ? "SL hit" : t.exit_reason === "target" ? "target hit" : "closed"}
+                        </Chip>
                       )}
                     </td>
                   </tr>
@@ -892,10 +960,11 @@ function PaperTradingPanel() {
       <div style={{ height: 8 }} />
       <EmptyNote>
         Simulated trades only — nothing here places a real order. Entry/exit premiums are either typed in or pulled
-        from the existing PCR tracker's live option chain (not every strike may be available there); lot size
-        defaults to a guess and should be confirmed against NSE's current contract spec before trusting PnL figures.
-        Live PnL on open trades refreshes every 5s from that same source — as fast as NSE's own data actually
-        updates, not faster.
+        from the live option chain above (Upstox when connected, otherwise the PCR tracker's NSE-derived feed); lot
+        size defaults to a guess and should be confirmed against NSE's current contract spec before trusting PnL
+        figures. Live premiums refresh every 1s. Stop-loss/target are watched client-side against that same feed and
+        auto-close the trade on a hit — this only happens while this page is open and polling; it is not a standing
+        order placed anywhere, so a level set here won't fire if you close the tab.
       </EmptyNote>
     </Panel>
   );
