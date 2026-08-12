@@ -36,6 +36,37 @@ jobs:
           fi
           echo "PREMARKET_BASE_URL = ${{ vars.PREMARKET_BASE_URL }}"
 
+      # The real trigger steps below now get past the "empty" check but
+      # fail with curl exit code 3 (URL malformed) -- so the value is
+      # non-empty but broken somehow (stray whitespace/newline from a
+      # copy-paste, missing scheme, etc). This step distinguishes those
+      # cases by exit code alone (readable without a token via the job's
+      # check-run annotations), since job log text isn't accessible here:
+      #   30 = has leading/trailing whitespace or an embedded newline
+      #   31 = doesn't start with http:// or https://
+      #   32 = still curl-malformed for some other reason
+      #   0  = looks fine
+      - name: Debug - inspect PREMARKET_BASE_URL for hidden characters
+        run: |
+          RAW="${{ vars.PREMARKET_BASE_URL }}"
+          TRIMMED=$(printf '%s' "$RAW" | tr -d '[:space:]')
+          if [ "$RAW" != "$TRIMMED" ]; then
+            echo "PREMARKET_BASE_URL contains whitespace or a newline character"
+            exit 30
+          fi
+          case "$RAW" in
+            http://*|https://*) : ;;
+            *)
+              echo "PREMARKET_BASE_URL does not start with http:// or https://"
+              exit 31
+              ;;
+          esac
+          if ! curl --fail --silent --show-error -o /dev/null "${RAW}/api/premarket/health" ; then
+            echo "PREMARKET_BASE_URL still curl-malformed or unreachable for another reason"
+            exit 32
+          fi
+          echo "PREMARKET_BASE_URL looks fine and /api/premarket/health responded"
+
       - name: Debug - check PREMARKET_JOB_API_KEY resolves
         run: |
           if [ -z "${{ secrets.PREMARKET_JOB_API_KEY }}" ]; then
