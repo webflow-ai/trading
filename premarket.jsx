@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceDot,
 } from "recharts";
@@ -398,13 +398,15 @@ function ParticipantPanel({ brief }) {
 
 /* ---------- paper trading journal ----------
    Simulated options trades: opened with an entry premium (typed in, or
-   pulled from the existing PCR tracker's live option chain at
-   /api/optionchain/today — same origin, a different app), closed later
-   with an exit premium, PnL computed server-side at close time. Nothing
-   here places a real order. */
+   pulled from the live option chain below), closed later with an exit
+   premium, PnL computed server-side at close time. Nothing here places a
+   real order. The chain itself prefers Upstox (real broker LTPs, 1s
+   refresh, requires connecting via /api/upstox/login) and falls back to
+   the PCR tracker's own NSE-derived /api/optionchain/today — same origin,
+   a different app — when Upstox isn't connected or errors. */
 const OPTION_TYPES = ["CE", "PE"];
 const TRADE_ACTIONS = ["BUY", "SELL"];
-const DEFAULT_LOT_SIZE_FALLBACK = 75; // mirrors paper_trading.DEFAULT_LOT_SIZE — see that module's own caveat about this being a guess, not an authoritative current value
+const DEFAULT_LOT_SIZE_FALLBACK = 65; // mirrors paper_trading.DEFAULT_LOT_SIZE — see that module's own caveat about this being a guess, not an authoritative current value
 
 const formLabelStyle = { display: "block", fontFamily: DISP, fontSize: 10, color: T.muted, marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.4 };
 const formInputStyle = { background: T.ink, border: `1px solid ${T.line}`, color: T.fg, borderRadius: 6, padding: "6px 8px", fontFamily: MONO, fontSize: 12, width: "100%", boxSizing: "border-box" };
@@ -438,14 +440,30 @@ function liveFigures(trade, chainByStrike) {
   return { invested, currentLtp, currentValue: currentLtp * trade.lot_size * trade.lots, pnl, isLive: true };
 }
 
+// Prefers Upstox (real broker LTPs, connected via /api/upstox/login) for
+// the second-by-second feed; falls back to the NSE-scrape-backed
+// /api/optionchain/today (same one "Fetch live" already used) whenever
+// Upstox isn't connected or errors, so the panel still works before/without
+// ever connecting Upstox. `source` on the result says which one answered.
 async function fetchChain() {
   try {
-    const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
-    if (!res.ok) return { spot: null, rows: [] };
-    const json = await res.json();
-    return { spot: json.spot ?? null, rows: json.rows || [] };
+    const res = await fetch(`${PCR_API_BASE}/upstox/optionchain?symbol=NIFTY`);
+    if (res.ok) {
+      const json = await res.json();
+      if (json.connected && (json.rows || []).length > 0) {
+        return { spot: json.spot ?? null, rows: json.rows, source: "upstox" };
+      }
+    }
   } catch {
-    return { spot: null, rows: [] }; // background tick -- not worth surfacing an error banner for
+    // fall through to the NSE fallback below
+  }
+  try {
+    const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
+    if (!res.ok) return { spot: null, rows: [], source: null };
+    const json = await res.json();
+    return { spot: json.spot ?? null, rows: json.rows || [], source: "nse" };
+  } catch {
+    return { spot: null, rows: [], source: null }; // background tick -- not worth surfacing an error banner for
   }
 }
 
@@ -482,6 +500,8 @@ function PaperTradingPanel() {
   const [chainRows, setChainRows] = useState([]);
   const [chainSpot, setChainSpot] = useState(null);
   const [chainByStrike, setChainByStrike] = useState({});
+  const [chainSource, setChainSource] = useState(null); // "upstox" | "nse" | null
+  const chainFetchInFlight = useRef(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [form, setForm] = useState({
@@ -500,6 +520,7 @@ function PaperTradingPanel() {
       setChainRows(chain.rows);
       setChainSpot(chain.spot);
       setChainByStrike(chainMapFromRows(chain.rows));
+      setChainSource(chain.source);
       setErr("");
     } catch (e) {
       setErr(e.message);
@@ -513,18 +534,26 @@ function PaperTradingPanel() {
   const openTrades = trades.filter((t) => t.status === "open");
 
   // Live option chain + PnL, broker-platform-style: re-pull just the chain
-  // (not the whole trades list) every 5s, so both the browsable CE/PE
-  // chain below and any open trade's unrealized PnL update on their own.
-  // 5s, not 1s: the underlying NSE data is itself CDN-cached on ~10-15s
-  // cycles upstream (see backend.py), so polling faster would just
-  // re-fetch identical numbers.
+  // (not the whole trades list) every 1s. Upstox (when connected) genuinely
+  // updates that fast; the NSE fallback is itself CDN-cached on ~10-15s
+  // cycles upstream (see backend.py) so it'll often just re-serve the same
+  // numbers between ticks -- harmless, not worth a separate slower interval
+  // for the fallback case. The in-flight guard skips a tick if the previous
+  // fetch hasn't finished yet, so a slow response can't pile up requests.
   useEffect(() => {
     const id = setInterval(async () => {
-      const chain = await fetchChain();
-      setChainRows(chain.rows);
-      setChainSpot(chain.spot);
-      setChainByStrike(chainMapFromRows(chain.rows));
-    }, 5000);
+      if (chainFetchInFlight.current) return;
+      chainFetchInFlight.current = true;
+      try {
+        const chain = await fetchChain();
+        setChainRows(chain.rows);
+        setChainSpot(chain.spot);
+        setChainByStrike(chainMapFromRows(chain.rows));
+        setChainSource(chain.source);
+      } finally {
+        chainFetchInFlight.current = false;
+      }
+    }, 1000);
     return () => clearInterval(id);
   }, []);
 
@@ -686,6 +715,19 @@ function PaperTradingPanel() {
               {chainSpot != null && (
                 <span style={{ color: T.fg, textTransform: "none", fontWeight: 400 }}> · spot {fmtNum(chainSpot, 1)}</span>
               )}
+              {chainSource && (
+                <span
+                  style={{
+                    marginLeft: 8, textTransform: "none", fontWeight: 600, fontSize: 10,
+                    color: chainSource === "upstox" ? T.cyan : T.amber,
+                  }}
+                  title={chainSource === "upstox"
+                    ? "Live via your connected Upstox account (1s refresh)"
+                    : "Upstox not connected — falling back to the NSE-derived feed. Visit /api/upstox/login to connect Upstox."}
+                >
+                  via {chainSource === "upstox" ? "Upstox" : "NSE fallback"}
+                </span>
+              )}
             </div>
             <span style={{ fontFamily: DISP, fontSize: 10, color: T.muted }}>Click a CE/PE premium to fill the form</span>
           </div>
@@ -755,7 +797,9 @@ function PaperTradingPanel() {
                 <th style={tradeThStyle}>Invested</th>
                 <th style={tradeThStyle}>LTP / Exit</th>
                 <th style={tradeThStyle}>Value</th>
-                <th style={tradeThStyle}>PnL</th>
+                <th style={tradeThStyle} title="Live running PnL while open (not yet real), or the exact amount booked once you've closed the trade">
+                  Unrealized / Booked
+                </th>
                 <th style={tradeThStyle}>Status</th>
               </tr>
             </thead>
@@ -786,7 +830,8 @@ function PaperTradingPanel() {
                     <td style={tradeTdStyle}>{currentValue != null ? fmtNum(currentValue, 0) : (isOpen ? "—" : fmtNum(invested + (t.pnl || 0), 0))}</td>
                     <td style={{ ...tradeTdStyle, color: pnl != null ? directionColor(pnl) : T.muted, fontWeight: 700 }}>
                       {pnl != null ? fmtSigned(pnl, 0) : "—"}
-                      {isOpen && isLive && <span style={{ color: T.muted, fontWeight: 400, fontSize: 10 }}> live</span>}
+                      {isOpen && isLive && <span style={{ color: T.muted, fontWeight: 400, fontSize: 10 }}> unrealized</span>}
+                      {!isOpen && pnl != null && <span style={{ color: T.muted, fontWeight: 400, fontSize: 10 }}> booked</span>}
                     </td>
                     <td style={tradeTdStyle}>
                       {isOpen ? (

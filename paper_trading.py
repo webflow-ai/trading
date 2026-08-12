@@ -17,7 +17,7 @@ import storage
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
-DEFAULT_LOT_SIZE = 75
+DEFAULT_LOT_SIZE = 65
 
 
 def compute_pnl(action: str, entry_price: float, exit_price: float, lot_size: int, lots: int) -> float:

@@ -138,6 +138,48 @@ async def get_strike_pcr_history(symbol: str, strike, day: str) -> list:
     return await get_history(f"strikepcr:{symbol}:{strike}:{day}")
 
 
+UPSTOX_TOKEN_REDIS_KEY = "upstox:access_token"
+# Upstox access tokens expire at ~3:30am IST the day after they're issued
+# (not a rolling TTL) -- 20h is a conservative window that comfortably
+# covers a token obtained anytime during market hours or the evening.
+UPSTOX_TOKEN_TTL_SECONDS = 20 * 3600
+
+
+async def save_upstox_token(access_token: str):
+    """Persists to Redis (not just the in-memory dict) so a token obtained
+    via one serverless invocation's /api/upstox/callback is actually visible
+    to the *next* invocation's option-chain request -- see the in-memory
+    dict's own doc comment above for why that alone isn't reliable here."""
+    upstox_token["access_token"] = access_token
+    upstox_token["obtained_at"] = dt.datetime.now(IST).isoformat()
+    try:
+        await redis_cmd("SET", UPSTOX_TOKEN_REDIS_KEY, access_token)
+        await redis_cmd("EXPIRE", UPSTOX_TOKEN_REDIS_KEY, UPSTOX_TOKEN_TTL_SECONDS)
+    except Exception as e:
+        print(f"upstox: failed to persist token to redis: {e}")
+
+
+async def load_upstox_token() -> str | None:
+    if upstox_token["access_token"]:
+        return upstox_token["access_token"]
+    try:
+        token = await redis_cmd("GET", UPSTOX_TOKEN_REDIS_KEY)
+        if token:
+            upstox_token["access_token"] = token
+            return token
+    except Exception as e:
+        print(f"upstox: failed to load token from redis: {e}")
+    return None
+
+
+async def clear_upstox_token():
+    upstox_token["access_token"] = None
+    try:
+        await redis_cmd("DEL", UPSTOX_TOKEN_REDIS_KEY)
+    except Exception as e:
+        print(f"upstox: failed to clear token in redis: {e}")
+
+
 async def claim_strike_persist_slot(symbol: str, day: str, now: dt.datetime) -> bool:
     """True at most once per STRIKE_PERSIST_INTERVAL_SECONDS per symbol/day —
     backed by Redis (not local memory) so the throttle holds across
@@ -321,9 +363,10 @@ async def upstox_configure(payload: dict):
 
 @app.get("/api/upstox/status")
 async def upstox_status():
+    token = await load_upstox_token()
     return {
         "configured": bool(upstox_config["api_key"] and upstox_config["api_secret"]),
-        "connected": bool(upstox_token["access_token"]),
+        "connected": bool(token),
         "obtainedAt": upstox_token["obtained_at"],
     }
 
@@ -363,11 +406,110 @@ async def upstox_callback(code: str = Query(None), error: str = Query(None)):
         if resp.status_code != 200:
             return f"<h3>Token exchange failed: {resp.status_code}</h3><pre>{resp.text}</pre>"
         j = resp.json()
-        upstox_token["access_token"] = j.get("access_token")
-        upstox_token["obtained_at"] = dt.datetime.now(IST).isoformat()
+        token = j.get("access_token")
+        if not token:
+            return f"<h3>Token exchange succeeded but no access_token in response</h3><pre>{resp.text}</pre>"
+        await save_upstox_token(token)
         return "<h2>&#9989; Upstox connected. You can close this tab.</h2>"
     except Exception as e:
         return f"<h3>Token exchange failed: {e}</h3>"
+
+
+UPSTOX_UNDERLYING_KEY = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
+}
+
+
+def _nse_expiry_to_iso(expiry: str) -> str:
+    """NSE's expiry strings look like '18-Aug-2026'; Upstox's option-chain
+    API wants '2026-08-18'. Falls back to the original string if it's
+    already ISO (or anything else unrecognized) so a format-string change
+    upstream degrades to an Upstox-side error instead of an exception here."""
+    try:
+        return dt.datetime.strptime(expiry, "%d-%b-%Y").date().isoformat()
+    except ValueError:
+        return expiry
+
+
+@app.get("/api/upstox/optionchain")
+async def upstox_optionchain(symbol: str = Query("NIFTY"), expiry: str = Query(None)):
+    """Live NIFTY/BANKNIFTY/FINNIFTY option chain sourced directly from
+    Upstox's own option-chain API (real broker LTPs from a live market-data
+    subscription) rather than the NSE scrape /api/optionchain/today relies
+    on -- built for the paper-trading journal's live price feed, which wants
+    tighter, more trustworthy refresh than NSE's own CDN caching allows.
+    Requires a connected session (see /api/upstox/login); the frontend
+    falls back to /api/optionchain/today when this reports not connected.
+
+    NOTE: field names below (call_options/put_options/market_data/oi/ltp)
+    follow Upstox's v2 option-chain response shape as documented, but this
+    hasn't been exercised against a live response yet (no token available
+    while building this) -- if Upstox renames/nests fields differently than
+    expected, this will come back with rows present but ltp/oi as null
+    rather than raising, so check a real response after connecting.
+    """
+    symbol = symbol.upper()
+    underlying_key = UPSTOX_UNDERLYING_KEY.get(symbol)
+    if not underlying_key:
+        return {"connected": False, "spot": None, "rows": [], "error": f"unsupported symbol for Upstox: {symbol}"}
+
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "spot": None, "rows": [], "error": "Upstox not connected — visit /api/upstox/login"}
+
+    if not expiry:
+        try:
+            expiry = _nse_expiry_to_iso(await get_nearest_expiry(symbol))
+        except Exception as e:
+            return {"connected": True, "spot": None, "rows": [], "error": f"couldn't resolve nearest expiry: {e}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as up_client:
+            resp = await up_client.get(
+                "https://api.upstox.com/v2/option/chain",
+                params={"instrument_key": underlying_key, "expiry_date": expiry},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+    except Exception as e:
+        return {"connected": True, "spot": None, "rows": [], "error": f"upstox request failed: {e}"}
+
+    if resp.status_code == 401:
+        # Token's dead (expired or revoked) -- clear it so /api/upstox/status
+        # reflects reality and the next call fails fast with "not connected"
+        # instead of repeating a doomed request every second.
+        await clear_upstox_token()
+        return {"connected": False, "spot": None, "rows": [], "error": "Upstox session expired — visit /api/upstox/login again"}
+    if resp.status_code != 200:
+        return {"connected": True, "spot": None, "rows": [], "error": f"upstox returned {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        return {"connected": True, "spot": None, "rows": [], "error": f"upstox returned non-JSON: {e}"}
+
+    data = payload.get("data") or []
+    spot = None
+    rows = []
+    for item in data:
+        if spot is None:
+            spot = item.get("underlying_spot_price")
+        call_md = (item.get("call_options") or {}).get("market_data") or {}
+        put_md = (item.get("put_options") or {}).get("market_data") or {}
+        rows.append({
+            "strike": item.get("strike_price"),
+            "ceOi": call_md.get("oi"),
+            "ceOiChg": call_md.get("oi_change") or call_md.get("oi_day_change"),
+            "ceVol": call_md.get("volume"),
+            "ceLtp": call_md.get("ltp"),
+            "peOi": put_md.get("oi"),
+            "peOiChg": put_md.get("oi_change") or put_md.get("oi_day_change"),
+            "peVol": put_md.get("volume"),
+            "peLtp": put_md.get("ltp"),
+        })
+    rows.sort(key=lambda r: r["strike"] if r["strike"] is not None else 0)
+    return {"connected": True, "symbol": symbol, "expiry": expiry, "spot": spot, "rows": rows}
 
 
 async def fetch_and_record_pcr(symbol: str, now: dt.datetime, persist_strikes: bool = False) -> dict:
