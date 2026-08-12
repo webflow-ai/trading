@@ -23,6 +23,29 @@ jobs:
   run-job:
     runs-on: ubuntu-latest
     steps:
+      # TEMPORARY: diagnosing why the vars/secrets below appear "set" in
+      # the GitHub UI but still resolve empty inside this workflow (curl
+      # never reaches Vercel at all). Fails loudly per-value so the step
+      # status alone (visible without a token) says which one is empty.
+      # Remove once the real trigger steps below succeed again.
+      - name: Debug - check PREMARKET_BASE_URL resolves
+        run: |
+          if [ -z "${{ vars.PREMARKET_BASE_URL }}" ]; then
+            echo "PREMARKET_BASE_URL is EMPTY"
+            exit 1
+          fi
+          echo "PREMARKET_BASE_URL = ${{ vars.PREMARKET_BASE_URL }}"
+
+      - name: Debug - check PREMARKET_JOB_API_KEY resolves
+        run: |
+          if [ -z "${{ secrets.PREMARKET_JOB_API_KEY }}" ]; then
+            echo "PREMARKET_JOB_API_KEY is EMPTY"
+            exit 1
+          fi
+          echo "PREMARKET_JOB_API_KEY is set (length only, not printing value): ${#PREMARKET_JOB_API_KEY}"
+        env:
+          PREMARKET_JOB_API_KEY: ${{ secrets.PREMARKET_JOB_API_KEY }}
+
       - name: Trigger evening job
         if: github.event.schedule == '0 14 * * 1-5' || github.event_name == 'workflow_dispatch'
         run: |
