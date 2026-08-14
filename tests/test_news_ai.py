@@ -20,12 +20,18 @@ class FakeResponse:
 
 
 class FakeAsyncClient:
-    def __init__(self, response=None):
+    def __init__(self, response=None, responses=None):
+        # `responses`: consumed one-per-call in order, for tests exercising
+        # a Gemini-then-OpenRouter sequence with different outcomes each.
+        # `response`: same one returned for every call (existing behavior).
         self._response = response
+        self._responses = list(responses) if responses is not None else None
         self.calls = []
 
     async def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        if self._responses is not None:
+            return self._responses.pop(0)
         return self._response
 
     async def aclose(self):
@@ -117,17 +123,17 @@ def test_build_prompt_numbers_headlines():
     assert "2. Second" in prompt
 
 
-def test_parse_gemini_response_plain_json():
+def test_parse_classifier_json_plain_json():
     text = '{"items": [{"headline": "H", "sentiment": "bullish", "reason": "r"}], "overall_sentiment": "Bullish"}'
-    result = news_ai._parse_gemini_response(text)
+    result = news_ai._parse_classifier_json(text)
     assert result["items"][0]["sentiment"] == "bullish"
     assert result["overall_sentiment"] == "Bullish"
     assert result["note"] is None
 
 
-def test_parse_gemini_response_strips_markdown_fences():
+def test_parse_classifier_json_strips_markdown_fences():
     text = '```json\n{"items": [], "overall_sentiment": "Neutral"}\n```'
-    result = news_ai._parse_gemini_response(text)
+    result = news_ai._parse_classifier_json(text)
     assert result["overall_sentiment"] == "Neutral"
 
 
@@ -136,21 +142,25 @@ def test_classify_headlines_returns_empty_result_for_no_headlines():
     assert result == {"items": [], "overall_sentiment": "No headlines available.", "note": None}
 
 
-def test_classify_headlines_falls_back_to_neutral_when_gemini_not_configured(monkeypatch):
+def test_classify_headlines_falls_back_to_neutral_when_neither_provider_configured(monkeypatch):
     monkeypatch.setattr(news_ai, "GEMINI_API_KEY", None)
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", None)
     result = asyncio.run(news_ai.classify_headlines(["H1", "H2"]))
-    assert result["note"] == "GEMINI_API_KEY not configured"
+    assert result["note"] == "GEMINI_API_KEY not configured; OPENROUTER_API_KEY not configured"
     assert all(item["sentiment"] == "neutral" for item in result["items"])
 
 
-def test_classify_headlines_falls_back_to_neutral_when_gemini_call_fails(monkeypatch):
+def test_classify_headlines_falls_back_to_neutral_when_gemini_fails_and_openrouter_not_configured(monkeypatch):
     monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", None)
     client = FakeAsyncClient(response=FakeResponse(raise_exc=httpx.HTTPError("Gemini unreachable")))
 
     result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
 
     assert "Gemini unreachable" in result["note"]
+    assert "OPENROUTER_API_KEY not configured" in result["note"]
     assert result["items"][0]["sentiment"] == "neutral"
+    assert len(client.calls) == 1  # OpenRouter never attempted -- not configured
 
 
 def test_classify_headlines_falls_back_when_response_has_no_visible_text(monkeypatch):
@@ -158,12 +168,84 @@ def test_classify_headlines_falls_back_when_response_has_no_visible_text(monkeyp
     # MAX_TOKENS with the budget spent entirely on hidden thinking tokens)
     # has candidates but no usable content/parts.
     monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", None)
     gemini_json = {"candidates": [{"finishReason": "MAX_TOKENS"}]}
     client = FakeAsyncClient(response=FakeResponse(json_data=gemini_json))
 
     result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
 
     assert "MAX_TOKENS" in result["note"]
+    assert result["items"][0]["sentiment"] == "neutral"
+
+
+def test_classify_headlines_falls_back_to_openrouter_when_gemini_fails(monkeypatch):
+    monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", "fake-or-key")
+    openrouter_json = {
+        "choices": [{"message": {"content":
+            '{"items": [{"headline": "H1", "sentiment": "bearish", "reason": "weak"}], '
+            '"overall_sentiment": "Mildly bearish"}'
+        }}],
+    }
+    client = FakeAsyncClient(responses=[
+        FakeResponse(raise_exc=httpx.HTTPError("Gemini 503")),
+        FakeResponse(json_data=openrouter_json),
+    ])
+
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
+
+    assert result["overall_sentiment"] == "Mildly bearish"
+    assert result["items"][0]["sentiment"] == "bearish"
+    assert "Gemini 503" in result["note"]
+    assert "OpenRouter fallback" in result["note"]
+    assert len(client.calls) == 2
+    or_url, or_kwargs = client.calls[1]
+    assert or_url == news_ai.OPENROUTER_API_URL
+    assert or_kwargs["headers"]["Authorization"] == "Bearer fake-or-key"
+    assert "H1" in or_kwargs["json"]["messages"][0]["content"]
+
+
+def test_classify_headlines_uses_openrouter_when_gemini_not_configured(monkeypatch):
+    monkeypatch.setattr(news_ai, "GEMINI_API_KEY", None)
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", "fake-or-key")
+    openrouter_json = {
+        "choices": [{"message": {"content":
+            '{"items": [{"headline": "H1", "sentiment": "neutral", "reason": "n/a"}], "overall_sentiment": "Flat"}'
+        }}],
+    }
+    client = FakeAsyncClient(response=FakeResponse(json_data=openrouter_json))
+
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
+
+    assert result["overall_sentiment"] == "Flat"
+    assert "GEMINI_API_KEY not configured" in result["note"]
+    assert "OpenRouter fallback" in result["note"]
+
+
+def test_classify_headlines_falls_back_when_openrouter_response_has_no_visible_text(monkeypatch):
+    monkeypatch.setattr(news_ai, "GEMINI_API_KEY", None)
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", "fake-or-key")
+    openrouter_json = {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+    client = FakeAsyncClient(response=FakeResponse(json_data=openrouter_json))
+
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
+
+    assert "empty OpenRouter response" in result["note"]
+    assert result["items"][0]["sentiment"] == "neutral"
+
+
+def test_classify_headlines_falls_back_to_neutral_when_both_providers_fail(monkeypatch):
+    monkeypatch.setattr(news_ai, "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(news_ai, "OPENROUTER_API_KEY", "fake-or-key")
+    client = FakeAsyncClient(responses=[
+        FakeResponse(raise_exc=httpx.HTTPError("Gemini down")),
+        FakeResponse(raise_exc=httpx.HTTPError("OpenRouter down")),
+    ])
+
+    result = asyncio.run(news_ai.classify_headlines(["H1"], client=client))
+
+    assert "Gemini down" in result["note"]
+    assert "OpenRouter down" in result["note"]
     assert result["items"][0]["sentiment"] == "neutral"
 
 

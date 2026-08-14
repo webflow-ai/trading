@@ -41,6 +41,13 @@ its core, one JSON-in/JSON-out HTTP call. Replaced with a direct httpx POST
 to Gemini's REST API — matches every other integration in this codebase
 (Supabase, Telegram, NSE, Yahoo all use raw httpx, no SDKs) and removes the
 dependency entirely.
+
+Verified live 2026-08-14: Gemini returned a flat 503 ("This model is
+currently experiencing high demand") — transient and Google-side, not a
+bug here, but it meant that day's brief fell all the way to the neutral
+fallback with no real classification at all. Added classify_headlines's
+OpenRouter fallback (openrouter.ai, free tier, no card required) for
+exactly this case — see OPENROUTER_API_KEY/_call_openrouter below.
 """
 
 import asyncio
@@ -55,6 +62,20 @@ import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
+# Free-tier fallback for when Gemini errors or times out (e.g. the 503
+# "model experiencing high demand" seen live 2026-08-14) -- openrouter.ai,
+# no card/purchase required. Usage here is ~2 calls/day (evening + morning
+# job), far under even the no-purchase free tier's 50/day cap, so this
+# genuinely costs nothing. gpt-oss-20b:free chosen after live-testing a few
+# free models: solid instruction-following, and (unlike some Gemini-backed
+# free models on OpenRouter, which share Google AI Studio's free quota and
+# were rate-limited on the same day Gemini itself was struggling) backed by
+# a different upstream provider, so it isn't correlated with Gemini's own
+# outages.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 RSS_FEEDS = {
     "reuters_business": "https://www.reutersagency.com/feed/?best-topics=business-finance",
@@ -202,10 +223,12 @@ def _build_prompt(headlines: list[str]) -> str:
     return PROMPT_TEMPLATE.format(headlines_block=block)
 
 
-def _parse_gemini_response(text: str) -> dict:
-    """Isolated from the network call so it's unit-testable. Gemini
-    sometimes wraps JSON in ```json fences despite being told not to —
-    stripped defensively before parsing."""
+def _parse_classifier_json(text: str) -> dict:
+    """Isolated from the network call so it's unit-testable. Shared by both
+    Gemini and the OpenRouter fallback -- same requested JSON shape either
+    way (see PROMPT_TEMPLATE), only how `text` gets extracted from the raw
+    HTTP response differs between them. Models sometimes wrap JSON in
+    ```json fences despite being told not to — stripped defensively."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
@@ -220,46 +243,90 @@ def _parse_gemini_response(text: str) -> dict:
     }
 
 
+async def _call_gemini(headlines: list[str], client: httpx.AsyncClient) -> dict:
+    resp = await client.post(
+        GEMINI_API_URL.format(model=GEMINI_MODEL),
+        params={"key": GEMINI_API_KEY},
+        json={"contents": [{"parts": [{"text": _build_prompt(headlines)}]}]},
+        # No generationConfig, deliberately, after two failed live
+        # attempts at one (both 2026-08-11): maxOutputTokens: 1024 got
+        # silently consumed by this model's hidden "thinking" tokens
+        # before any visible JSON was produced (truncated, unparseable
+        # response); thinkingConfig.thinkingBudget: 0 to turn thinking
+        # off outright isn't a supported field on this model/API version
+        # at all (flat 400 Bad Request). MAX_HEADLINES above is the only
+        # verified-safe lever for cutting this call's latency.
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    candidate = (data.get("candidates") or [{}])[0]
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = parts[0]["text"] if parts else ""
+    if not text:
+        raise ValueError(f"empty Gemini response (finishReason={candidate.get('finishReason')})")
+    return _parse_classifier_json(text)
+
+
+async def _call_openrouter(headlines: list[str], client: httpx.AsyncClient) -> dict:
+    """OpenAI-compatible chat-completions endpoint, not Gemini's
+    generateContent -- different request/response shape, same prompt.
+    gpt-oss-20b:free is a reasoning model: its response separates
+    "reasoning" from "content"; only content (the actual answer) matters
+    here, live-verified 2026-08-14 not to leak reasoning text into it."""
+    resp = await client.post(
+        OPENROUTER_API_URL,
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": _build_prompt(headlines)}],
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choice = (data.get("choices") or [{}])[0]
+    text = (choice.get("message") or {}).get("content") or ""
+    if not text:
+        raise ValueError(f"empty OpenRouter response (finish_reason={choice.get('finish_reason')})")
+    return _parse_classifier_json(text)
+
+
 async def classify_headlines(headlines: list[str], client: httpx.AsyncClient | None = None) -> dict:
     """{"items": [{"headline", "sentiment", "reason"}, ...],
-    "overall_sentiment": "<one-line>", "note": str|None}. Falls back to an
-    all-neutral result (never raises) if Gemini isn't configured or the call
-    fails, per the brief's own instruction.
+    "overall_sentiment": "<one-line>", "note": str|None}. Tries Gemini
+    first, falls back to OpenRouter's free tier if Gemini isn't configured
+    or its call fails, and only then falls back to an all-neutral result
+    (never raises) — per the brief's own instruction to degrade gracefully.
 
-    Raw REST (POST .../models/{model}:generateContent?key=...), not the
-    google-generativeai SDK — see this module's docstring for why."""
+    Raw REST throughout (no SDK for either provider) — see this module's
+    docstring for why, re: Gemini specifically."""
     if not headlines:
         return {"items": [], "overall_sentiment": "No headlines available.", "note": None}
-    if not GEMINI_API_KEY:
-        print("news_ai: GEMINI_API_KEY not set, returning neutral fallback")
-        return _neutral_fallback(headlines, note="GEMINI_API_KEY not configured")
+
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=30)
+    errors = []
     try:
-        resp = await client.post(
-            GEMINI_API_URL.format(model=GEMINI_MODEL),
-            params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": _build_prompt(headlines)}]}]},
-            # No generationConfig, deliberately, after two failed live
-            # attempts at one (both 2026-08-11): maxOutputTokens: 1024 got
-            # silently consumed by this model's hidden "thinking" tokens
-            # before any visible JSON was produced (truncated, unparseable
-            # response); thinkingConfig.thinkingBudget: 0 to turn thinking
-            # off outright isn't a supported field on this model/API version
-            # at all (flat 400 Bad Request). MAX_HEADLINES above is the only
-            # verified-safe lever for cutting this call's latency.
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        candidate = (data.get("candidates") or [{}])[0]
-        parts = (candidate.get("content") or {}).get("parts") or []
-        text = parts[0]["text"] if parts else ""
-        if not text:
-            raise ValueError(f"empty Gemini response (finishReason={candidate.get('finishReason')})")
-        return _parse_gemini_response(text)
-    except Exception as e:
-        print(f"news_ai: Gemini classification failed: {e}")
-        return _neutral_fallback(headlines, note=f"Gemini call failed: {e}")
+        if GEMINI_API_KEY:
+            try:
+                return await _call_gemini(headlines, client)
+            except Exception as e:
+                print(f"news_ai: Gemini classification failed: {e}")
+                errors.append(f"Gemini call failed: {e}")
+        else:
+            errors.append("GEMINI_API_KEY not configured")
+
+        if OPENROUTER_API_KEY:
+            try:
+                result = await _call_openrouter(headlines, client)
+                result["note"] = "; ".join(errors + [f"used OpenRouter fallback ({OPENROUTER_MODEL})"])
+                return result
+            except Exception as e:
+                print(f"news_ai: OpenRouter classification failed: {e}")
+                errors.append(f"OpenRouter call failed: {e}")
+        else:
+            errors.append("OPENROUTER_API_KEY not configured")
+
+        return _neutral_fallback(headlines, note="; ".join(errors))
     finally:
         if owns_client:
             await client.aclose()
