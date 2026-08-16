@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceDot,
+  BarChart, Bar, Cell, AreaChart, Area,
 } from "recharts";
+import { createChart, CrosshairMode } from "lightweight-charts";
 
 /* ---------- design tokens ----------
    Mirrors main.jsx's palette exactly for visual consistency across the two
@@ -393,6 +395,578 @@ function ParticipantPanel({ brief }) {
       <Row label="DII cash" value={cash?.dii_buy != null ? `buy ${fmtNum(cash.dii_buy, 0)} / sell ${fmtNum(cash.dii_sell, 0)}` : "unavailable"}
         color={cash?.dii_buy != null && cash?.dii_sell != null ? directionColor(cash.dii_buy - cash.dii_sell) : undefined} />
     </Panel>
+  );
+}
+
+/* ---------- top-10 Nifty movers (live, weighted-contribution predictor) ----------
+   Reads api/index.py's /api/upstox/movers — same origin, the PCR tracker
+   app, not this engine — every MOVERS_POLL_MS while mounted, same
+   cross-app pattern PaperTradingPanel's fetchChain() already uses for the
+   live option chain below. Every fresh, connected reading is throttled
+   client-side to at most one POST /movers/snapshot (this engine's own
+   endpoint) every MOVERS_SNAPSHOT_THROTTLE_MS, building the history
+   movers/accuracy scores against — there's no server-side job for this
+   the way there is for the morning brief, since the signal is only
+   meaningful live during market hours.
+
+   Separately, /api/upstox/movers/history feeds the per-stock intraday area
+   charts below — one Upstox request per stock server-side (no batch
+   history endpoint exists), so it's polled far less often than the live
+   quote endpoint. */
+const MOVERS_POLL_MS = 5000;
+const MOVERS_SNAPSHOT_THROTTLE_MS = 5 * 60 * 1000;
+const MOVERS_HISTORY_POLL_MS = 60000;
+
+function StockAreaChart({ symbol, name, points, pctChange, onClick }) {
+  const color = directionColor(pctChange);
+  const chartData = useMemo(() => (points || []).map((p) => ({
+    t: p.t, close: p.close,
+    label: new Date(p.t).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }),
+  })), [points]);
+
+  return (
+    <div
+      onClick={onClick}
+      title={`Click for ${name}'s full chart`}
+      style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, padding: "8px 10px", cursor: onClick ? "pointer" : "default" }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+        <span style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: T.fg }}>{symbol}</span>
+        <span style={{ fontFamily: MONO, fontSize: 11, color }}>{pctChange != null ? `${fmtSigned(pctChange, 2)}%` : "—"}</span>
+      </div>
+      {chartData.length < 2 ? (
+        <div style={{ height: 60, display: "flex", alignItems: "center", fontFamily: DISP, fontSize: 10, color: T.muted }}>
+          No intraday history yet
+        </div>
+      ) : (
+        <div style={{ height: 60 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={chartData} margin={{ top: 2, right: 2, bottom: 0, left: 2 }}>
+              <defs>
+                <linearGradient id={`movers-area-${symbol}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={color} stopOpacity={0.35} />
+                  <stop offset="100%" stopColor={color} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <XAxis dataKey="label" hide />
+              <YAxis domain={["dataMin", "dataMax"]} hide />
+              <Tooltip
+                contentStyle={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, fontFamily: MONO, fontSize: 11 }}
+                labelStyle={{ color: T.muted }}
+                formatter={(v) => [fmtNum(v, 2), name]}
+              />
+              <Area type="monotone" dataKey="close" stroke={color} strokeWidth={1.5} fill={`url(#movers-area-${symbol})`} isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Matches api/index.py's UPSTOX_INTRADAY_INTERVALS keys exactly -- the
+// backend rejects anything else with a 400-shaped {error} response.
+const HISTORY_INTERVALS = [
+  { value: "5minute", label: "5m" },
+  { value: "15minute", label: "15m" },
+  { value: "30minute", label: "30m" },
+];
+
+// Real candlestick + volume chart via TradingView's own open-source
+// "Lightweight Charts" library (Apache-2.0, not the paid/licensed
+// Charting Library that powers Upstox Pro Web -- that one requires a
+// business application to TradingView plus a private datafeed, neither
+// obtainable here; this is the closest honest equivalent: TradingView's
+// real charting engine and visual language, driven by this app's own
+// real Upstox OHLCV data). Recreates the chart fresh per symbol (cheap,
+// avoids carrying stale series state across stocks) and swaps just the
+// price series (candlestick vs area) when chartType changes, since
+// lightweight-charts models those as distinct series types on the same
+// chart instance rather than one interchangeable series.
+function LightweightChart({ symbol, points, chartType }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const volumeSeriesRef = useRef(null);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = createChart(containerRef.current, {
+      layout: { background: { color: T.panel }, textColor: T.muted, fontFamily: MONO },
+      grid: { vertLines: { color: T.line }, horzLines: { color: T.line } },
+      crosshair: { mode: CrosshairMode.Normal },
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: T.line },
+      rightPriceScale: { borderColor: T.line },
+      autoSize: true,
+    });
+    chartRef.current = chart;
+
+    const volumeSeries = chart.addHistogramSeries({
+      priceFormat: { type: "volume" }, priceScaleId: "volume", lastValueVisible: false, priceLineVisible: false,
+    });
+    chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    volumeSeriesRef.current = volumeSeries;
+
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+      volumeSeriesRef.current = null;
+    };
+  }, [symbol]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (seriesRef.current) chart.removeSeries(seriesRef.current);
+    seriesRef.current = chartType === "candles"
+      ? chart.addCandlestickSeries({
+          upColor: T.put, downColor: T.call, borderVisible: false, wickUpColor: T.put, wickDownColor: T.call,
+        })
+      : chart.addAreaSeries({ lineColor: T.cyan, topColor: `${T.cyan}55`, bottomColor: `${T.cyan}00`, lineWidth: 2 });
+  }, [chartType]);
+
+  useEffect(() => {
+    if (!seriesRef.current) return;
+    const sorted = [...(points || [])]
+      .map((p) => ({ ...p, time: Math.floor(new Date(p.t).getTime() / 1000) }))
+      .sort((a, b) => a.time - b.time);
+
+    seriesRef.current.setData(chartType === "candles"
+      ? sorted.map((p) => ({ time: p.time, open: p.open, high: p.high, low: p.low, close: p.close }))
+      : sorted.map((p) => ({ time: p.time, value: p.close })));
+
+    volumeSeriesRef.current?.setData(
+      sorted.filter((p) => p.volume != null)
+        .map((p) => ({ time: p.time, value: p.volume, color: p.close >= p.open ? `${T.put}66` : `${T.call}66` })),
+    );
+    chartRef.current?.timeScale().fitContent();
+  }, [points, chartType]);
+
+  return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
+}
+
+// Expanded single-stock chart, opened by clicking a tile or table row in
+// MoversPanel below. Starts from whatever history/quote data the panel
+// already has in state (same 30-minute series backing the small sparkline,
+// passed in as `points`) so the chart is visible instantly with no fetch
+// on open. Switching the interval picker below re-fetches just this one
+// stock at the new granularity via /api/upstox/stock/history -- lighter
+// than the panel's own batch endpoint, which always pulls all 10. Area vs.
+// candlestick is purely a client-side rendering choice off whichever
+// points are currently loaded, toggled independently of interval.
+//
+// Note: an actual TradingView widget embed was tried here first and
+// reverted -- verified live that their free public "Advanced Chart"
+// widget doesn't carry real-time NSE (India) data without the viewer
+// being logged into their own TradingView account or a paid data-
+// licensing agreement on TradingView's side; it either showed "This
+// symbol is only available on TradingView" or silently substituted an
+// unrelated US symbol (Apple Inc). LightweightChart above is the
+// practical middle ground: TradingView's own real charting engine, real
+// Upstox data.
+function StockDetailModal({ symbol, name, ltp, pctChange, points, onClose }) {
+  const [chartType, setChartType] = useState("area");
+  const [interval, setIntervalValue] = useState("30minute");
+  const [ownPoints, setOwnPoints] = useState(points);
+  const [loadingPoints, setLoadingPoints] = useState(false);
+  const color = directionColor(pctChange);
+
+  const selectInterval = useCallback(async (value) => {
+    setIntervalValue(value);
+    if (value === "30minute") {
+      setOwnPoints(points); // already have this one from the panel -- no fetch needed
+      return;
+    }
+    setLoadingPoints(true);
+    try {
+      const res = await fetch(`${PCR_API_BASE}/upstox/stock/history?symbol=${symbol}&interval=${value}`);
+      const json = await res.json();
+      setOwnPoints(json.points || []);
+    } catch {
+      setOwnPoints([]);
+    } finally {
+      setLoadingPoints(false);
+    }
+  }, [symbol, points]);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(10,15,30,0.75)", zIndex: 1000,
+        display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: T.panel, border: `1px solid ${T.line}`, borderRadius: 12, padding: 20,
+          width: "100%", maxWidth: 900, height: "85vh", display: "flex", flexDirection: "column",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12, flexShrink: 0 }}>
+          <div>
+            <div style={{ fontFamily: DISP, fontSize: 18, fontWeight: 700, color: T.fg }}>{name}</div>
+            <div style={{ fontFamily: MONO, fontSize: 12, color: T.muted }}>{symbol}</div>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            style={{
+              width: 30, height: 30, borderRadius: "50%", background: T.panel2, color: T.muted,
+              border: `1px solid ${T.line}`, cursor: "pointer", fontSize: 14, lineHeight: 1, flexShrink: 0,
+            }}
+          >
+            ✕
+          </button>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10, flexWrap: "wrap", gap: 10, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+            <div style={{ fontFamily: MONO, fontSize: 26, fontWeight: 700, color: T.fg }}>{ltp != null ? fmtNum(ltp, 2) : "—"}</div>
+            <div style={{ fontFamily: MONO, fontSize: 14, color }}>{pctChange != null ? `${fmtSigned(pctChange, 2)}%` : "—"}</div>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => setChartType("area")} style={formButtonStyle(chartType === "area", false)}>Area</button>
+            <button onClick={() => setChartType("candles")} style={formButtonStyle(chartType === "candles", false)}>Candles</button>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, flexShrink: 0 }}>
+          <span style={{ fontFamily: DISP, fontSize: 10, color: T.muted, textTransform: "uppercase", letterSpacing: 0.4, marginRight: 2 }}>Interval</span>
+          {HISTORY_INTERVALS.map((iv) => (
+            <button
+              key={iv.value} onClick={() => selectInterval(iv.value)}
+              disabled={loadingPoints} style={formButtonStyle(interval === iv.value, loadingPoints)}
+            >
+              {iv.label}
+            </button>
+          ))}
+          {loadingPoints && <span style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginLeft: 4 }}>Loading…</span>}
+        </div>
+
+        {(ownPoints || []).length < 2 ? (
+          <EmptyNote>{loadingPoints ? "Loading…" : "No chart data available for this stock yet."}</EmptyNote>
+        ) : (
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <LightweightChart symbol={symbol} points={ownPoints} chartType={chartType} />
+          </div>
+        )}
+
+        <div style={{ marginTop: 10, fontFamily: DISP, fontSize: 11, color: T.muted, flexShrink: 0 }}>
+          Today's intraday path when the market's live; falls back to the last ~10 days of daily closes outside trading hours.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MoversPanel() {
+  const [data, setData] = useState(null); // { connected, stocks, implied_move_pct, verdict, error }
+  const [history, setHistory] = useState(null); // { connected, series: { SYMBOL: [{t, close}, ...] } }
+  const [accuracy, setAccuracy] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [selectedSymbol, setSelectedSymbol] = useState(null);
+  const fetchInFlight = useRef(false);
+  const historyFetchInFlight = useRef(false);
+  const lastSnapshotAt = useRef(0);
+
+  const loadAccuracy = useCallback(async () => {
+    try {
+      setAccuracy(await getJSON("/movers/accuracy?days=30"));
+    } catch {
+      // background refresh -- accuracy is a nice-to-have, not worth an error banner
+    }
+  }, []);
+
+  useEffect(() => { loadAccuracy(); }, [loadAccuracy]);
+
+  useEffect(() => {
+    const tick = async () => {
+      if (fetchInFlight.current) return;
+      fetchInFlight.current = true;
+      try {
+        const res = await fetch(`${PCR_API_BASE}/upstox/movers`);
+        const json = await res.json();
+        setData(json);
+
+        const now = Date.now();
+        if (json.connected && json.implied_move_pct != null && now - lastSnapshotAt.current > MOVERS_SNAPSHOT_THROTTLE_MS) {
+          lastSnapshotAt.current = now;
+          postJSON("/movers/snapshot", {
+            implied_move_pct: json.implied_move_pct, verdict: json.verdict, stocks: json.stocks,
+          }).then(loadAccuracy).catch(() => {});
+        }
+      } catch {
+        // background tick -- not worth surfacing an error banner for
+      } finally {
+        setLoading(false);
+        fetchInFlight.current = false;
+      }
+    };
+    tick();
+    const id = setInterval(tick, MOVERS_POLL_MS);
+    return () => clearInterval(id);
+  }, [loadAccuracy]);
+
+  useEffect(() => {
+    const tick = async () => {
+      if (historyFetchInFlight.current) return;
+      historyFetchInFlight.current = true;
+      try {
+        const res = await fetch(`${PCR_API_BASE}/upstox/movers/history?interval=30minute`);
+        setHistory(await res.json());
+      } catch {
+        // background tick -- charts just stay empty for this cycle
+      } finally {
+        historyFetchInFlight.current = false;
+      }
+    };
+    tick();
+    const id = setInterval(tick, MOVERS_HISTORY_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  const chartData = useMemo(() => {
+    return (data?.stocks || [])
+      .filter((s) => s.pct_change != null)
+      .map((s) => ({ symbol: s.symbol, pct_change: s.pct_change, contribution_pct: s.contribution_pct }))
+      .sort((a, b) => b.pct_change - a.pct_change);
+  }, [data]);
+
+  const totalWeight = useMemo(() => (data?.stocks || []).reduce((sum, s) => sum + (s.weight_pct || 0), 0), [data]);
+
+  return (
+    <div style={{ gridColumn: "1 / -1" }}>
+      <Panel
+        title="Top 10 Nifty movers (live)"
+        right={
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {accuracy?.hit_rate_pct != null && (
+              <span title="Rolling hit-rate: this signal's predicted direction vs Nifty's actual next-day open, last 30 sessions">
+                <Chip color={T.cyan}>Predictor accuracy: {fmtNum(accuracy.hit_rate_pct, 1)}%</Chip>
+              </span>
+            )}
+            <span
+              style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: data?.connected ? T.cyan : T.amber }}
+              title={data?.connected ? "Live via your connected Upstox account" : "Upstox not connected — visit /api/upstox/login to see live movers"}
+            >
+              {data?.connected ? "via Upstox" : "not connected"}
+            </span>
+          </div>
+        }
+      >
+        {loading ? (
+          <EmptyNote>Loading…</EmptyNote>
+        ) : !data?.connected ? (
+          <EmptyNote>{data?.error || "Upstox not connected — visit /api/upstox/login to see live movers."}</EmptyNote>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 14, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontFamily: MONO, fontSize: 28, fontWeight: 700, color: directionColor(data.implied_move_pct) }}>
+                  {fmtSigned(data.implied_move_pct, 2)}%
+                </div>
+                <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>implied move from top-10 weight</div>
+              </div>
+              {data.verdict && (
+                <Chip color={VERDICT_COLOR[data.verdict] || T.muted}>{VERDICT_EMOJI[data.verdict]} {data.verdict}</Chip>
+              )}
+            </div>
+
+            <div style={{ height: 180, marginBottom: 14 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData} margin={{ top: 6, right: 6, bottom: 0, left: 6 }}>
+                  <CartesianGrid stroke={T.line} strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="symbol" tick={{ fontFamily: MONO, fontSize: 10, fill: T.muted }} />
+                  <YAxis tick={{ fontFamily: MONO, fontSize: 10, fill: T.muted }} tickFormatter={(v) => `${v}%`} />
+                  <Tooltip
+                    contentStyle={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, fontFamily: MONO, fontSize: 12 }}
+                    labelStyle={{ color: T.muted }}
+                    formatter={(v, name) => [`${fmtSigned(v, 2)}%`, name === "pct_change" ? "change" : "index contribution"]}
+                  />
+                  <Bar dataKey="pct_change" radius={[3, 3, 0, 0]}>
+                    {chartData.map((d) => <Cell key={d.symbol} fill={directionColor(d.pct_change)} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+                <thead>
+                  <tr style={{ color: T.muted, textAlign: "left" }}>
+                    <th style={tradeThStyle}>Stock</th>
+                    <th style={tradeThStyle}>Weight</th>
+                    <th style={tradeThStyle}>LTP</th>
+                    <th style={tradeThStyle}>Change</th>
+                    <th style={tradeThStyle}>Contribution</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(data.stocks || []).map((s) => (
+                    <tr
+                      key={s.symbol} onClick={() => setSelectedSymbol(s.symbol)}
+                      title={`Click for ${s.name}'s full chart`}
+                      style={{ borderTop: `1px solid ${T.line}`, cursor: "pointer" }}
+                    >
+                      <td style={tradeTdStyle}>{s.name}</td>
+                      <td style={{ ...tradeTdStyle, color: T.muted }}>{fmtNum(s.weight_pct, 1)}%</td>
+                      <td style={tradeTdStyle}>{s.ltp != null ? fmtNum(s.ltp, 2) : "—"}</td>
+                      <td style={{ ...tradeTdStyle, color: directionColor(s.pct_change) }}>
+                        {s.pct_change != null ? `${fmtSigned(s.pct_change, 2)}%` : "—"}
+                      </td>
+                      <td style={{ ...tradeTdStyle, color: directionColor(s.contribution_pct) }}>
+                        {s.contribution_pct != null ? `${fmtSigned(s.contribution_pct, 3)}pp` : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ marginTop: 10, fontFamily: DISP, fontSize: 11, color: T.muted }}>
+              Implied move = Σ(weight% × %change) across these 10 stocks (~{fmtNum(totalWeight, 0)}% of index weight) — a directional
+              signal from the heaviest names, not the actual Nifty change. Automated analysis for information only — not investment advice.
+            </div>
+
+            <div style={{ marginTop: 18, fontFamily: DISP, fontSize: 12, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>
+              Price history
+            </div>
+            <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginBottom: 8 }}>
+              Today's intraday path when the market's live; falls back to the last ~10 days of daily closes outside trading hours (weekends/holidays/pre-open).
+            </div>
+            {!history?.connected ? (
+              <EmptyNote>{history?.error || "Loading intraday history…"}</EmptyNote>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 10 }}>
+                {(data.stocks || []).map((s) => (
+                  <StockAreaChart
+                    key={s.symbol} symbol={s.symbol} name={s.name}
+                    points={history.series?.[s.symbol]} pctChange={s.pct_change}
+                    onClick={() => setSelectedSymbol(s.symbol)}
+                  />
+                ))}
+              </div>
+            )}
+
+            {selectedSymbol && (() => {
+              const s = (data.stocks || []).find((row) => row.symbol === selectedSymbol);
+              return (
+                <StockDetailModal
+                  symbol={selectedSymbol} name={s?.name || selectedSymbol}
+                  ltp={s?.ltp} pctChange={s?.pct_change}
+                  points={history?.series?.[selectedSymbol]}
+                  onClose={() => setSelectedSymbol(null)}
+                />
+              );
+            })()}
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/* ---------- full Nifty 50 board (unweighted market breadth) ----------
+   Complements MoversPanel's weighted top-10 predictor with plain price
+   action across all ~50 constituents (see api/index.py's NIFTY50_ALL for
+   the membership-staleness caveat -- this list is a best-effort snapshot,
+   not fetched live, and individual stale/wrong entries just show as a
+   null row rather than breaking the board). Slower poll than the top-10
+   panel (50 quotes is more payload, and index breadth doesn't need
+   1s-class freshness) but the same in-flight-guard pattern. */
+const NIFTY50_POLL_MS = 10000;
+
+function Nifty50Panel() {
+  const [data, setData] = useState(null); // { connected, stocks, advances, declines, unchanged, error }
+  const [loading, setLoading] = useState(true);
+  const fetchInFlight = useRef(false);
+
+  useEffect(() => {
+    const tick = async () => {
+      if (fetchInFlight.current) return;
+      fetchInFlight.current = true;
+      try {
+        const res = await fetch(`${PCR_API_BASE}/upstox/nifty50`);
+        setData(await res.json());
+      } catch {
+        // background tick -- not worth surfacing an error banner for
+      } finally {
+        setLoading(false);
+        fetchInFlight.current = false;
+      }
+    };
+    tick();
+    const id = setInterval(tick, NIFTY50_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  const total = (data?.advances || 0) + (data?.declines || 0) + (data?.unchanged || 0);
+
+  return (
+    <div style={{ gridColumn: "1 / -1" }}>
+      <Panel
+        title="Nifty 50 (live)"
+        right={
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {total > 0 && (
+              <>
+                <Chip color={T.put}>{data.advances} ↑</Chip>
+                <Chip color={T.call}>{data.declines} ↓</Chip>
+              </>
+            )}
+            <span
+              style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: data?.connected ? T.cyan : T.amber }}
+              title={data?.connected ? "Live via your connected Upstox account" : "Upstox not connected — visit /api/upstox/login to see the live board"}
+            >
+              {data?.connected ? "via Upstox" : "not connected"}
+            </span>
+          </div>
+        }
+      >
+        {loading ? (
+          <EmptyNote>Loading…</EmptyNote>
+        ) : !data?.connected ? (
+          <EmptyNote>{data?.error || "Upstox not connected — visit /api/upstox/login to see the live Nifty 50 board."}</EmptyNote>
+        ) : (
+          <>
+            <div style={{ maxHeight: 420, overflowY: "auto", overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+                <thead>
+                  <tr style={{ color: T.muted, textAlign: "left", position: "sticky", top: 0, background: T.panel }}>
+                    <th style={tradeThStyle}>Stock</th>
+                    <th style={tradeThStyle}>LTP</th>
+                    <th style={tradeThStyle}>Change</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(data.stocks || []).map((s) => (
+                    <tr key={s.symbol} style={{ borderTop: `1px solid ${T.line}` }}>
+                      <td style={tradeTdStyle}>{s.name}</td>
+                      <td style={tradeTdStyle}>{s.ltp != null ? fmtNum(s.ltp, 2) : "—"}</td>
+                      <td style={{ ...tradeTdStyle, color: directionColor(s.pct_change) }}>
+                        {s.pct_change != null ? `${fmtSigned(s.pct_change, 2)}%` : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ marginTop: 10, fontFamily: DISP, fontSize: 11, color: T.muted }}>
+              Sorted by %change, biggest gainers first. Membership/ISINs are a best-effort snapshot (see the endpoint's own docstring) —
+              a handful of stale or wrong entries show up as missing rows here rather than breaking the board.
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
   );
 }
 
@@ -1305,6 +1879,8 @@ export default function App() {
           <ParticipantPanel brief={brief} />
           <EventsNewsPanel brief={brief} />
           <LevelsPanel brief={brief} />
+          <MoversPanel />
+          <Nifty50Panel />
           <div style={{ gridColumn: "1 / -1" }}>
             <PaperTradingPanel />
           </div>

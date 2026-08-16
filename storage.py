@@ -244,3 +244,22 @@ async def get_paper_trades(status: str | None = None, days: int = 90) -> list[di
 async def get_paper_trade(trade_id: int) -> dict | None:
     rows = await _select("paper_trades", id=f"eq.{trade_id}", limit="1")
     return rows[0] if rows else None
+
+
+# ---------------- top-10 movers accuracy tracking ----------------
+
+async def save_movers_snapshot(snapshot: dict) -> None:
+    """snapshot: {trade_date, implied_move_pct, verdict, stocks} from
+    api/index.py's /api/upstox/movers, taken by the frontend (see
+    premarket.jsx's MoversPanel) at most once every few minutes. Inserted,
+    not upserted -- intraday readings for the same trade_date are expected
+    to change as prices move through the session, and movers_accuracy()
+    below only ever looks at the latest row per day."""
+    await _insert("movers_snapshots", snapshot)
+
+
+async def get_movers_snapshots(days: int = 30) -> list[dict]:
+    """Newest-first, one row per snapshot taken (not deduped per day) --
+    callers that want one-per-day (e.g. accuracy scoring) reduce client-side,
+    same as get_participant_history()'s convention above."""
+    return await _select("movers_snapshots", order="captured_at.desc", limit=str(days * 50))

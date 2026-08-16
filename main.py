@@ -130,6 +130,77 @@ async def positioning_fii_trend(days: int = Query(30)):
     return {"days": days, "rows": await storage.get_fii_trend(days=days)}
 
 
+@app.post("/api/premarket/movers/snapshot")
+async def movers_snapshot(payload: dict):
+    """Persists one reading of the top-10-movers implied move (see
+    api/index.py's /api/upstox/movers) so movers_accuracy() below has
+    history to score. Called by premarket.jsx's MoversPanel, client-side
+    throttled to roughly once every few minutes -- there's no
+    evening/morning job wired to this the way there is for morning_briefs,
+    since the movers signal is only meaningful live during market hours,
+    not something to compute once at 8:15am."""
+    trade_date = payload.get("trade_date") or dt.datetime.now(IST).date().isoformat()
+    await storage.save_movers_snapshot({
+        "trade_date": trade_date,
+        "implied_move_pct": payload.get("implied_move_pct"),
+        "verdict": payload.get("verdict"),
+        "stocks": payload.get("stocks"),
+    })
+    return {"ok": True}
+
+
+async def _nifty_close_on(trade_date: str, client) -> float | None:
+    """^NSEI's own daily close on `trade_date` -- the "previous_close" a
+    verdict taken during `trade_date`'s session is implicitly predicting
+    the *next* day's gap from. Separate from _actual_open_after (which
+    finds the *next* day's open) since movers_snapshots, unlike
+    morning_briefs, doesn't already carry previous_close as a stored
+    component."""
+    candles = await market_data.fetch_ohlc_candles(client, "^NSEI", interval="1d", rng="3mo")
+    target = dt.date.fromisoformat(trade_date)
+    for c in candles:
+        if c["dt"].date() == target:
+            return c["close"]
+    return None
+
+
+@app.get("/api/premarket/movers/accuracy")
+async def movers_accuracy(days: int = Query(30)):
+    """Same hit/miss idea as /brief/history, applied to the much simpler
+    top-10-weighted-contribution signal instead of the full morning-brief
+    score: for each trade_date, take its *latest* snapshot (the reading
+    closest to how the day actually played out) and compare its verdict's
+    direction against Nifty's actual next-day open (vs. that same day's own
+    close), reusing _classify_direction/_verdict_direction/_actual_open_after
+    from the brief-history endpoint above so "hit" means the same thing in
+    both places."""
+    rows = await storage.get_movers_snapshots(days=days)
+    latest_by_date: dict[str, dict] = {}
+    for row in rows:  # newest-first, so the first row seen per date is already the latest
+        latest_by_date.setdefault(row["trade_date"], row)
+
+    out = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for trade_date, row in sorted(latest_by_date.items(), reverse=True)[:days]:
+            previous_close = await _nifty_close_on(trade_date, client)
+            actual_open = await _actual_open_after(trade_date, client)
+            actual_direction = _classify_direction(previous_close, actual_open)
+            predicted_direction = _verdict_direction(row.get("verdict"))
+            hit = (
+                actual_direction is not None and predicted_direction is not None
+                and actual_direction == predicted_direction
+            )
+            out.append({
+                "trade_date": trade_date, "implied_move_pct": row.get("implied_move_pct"),
+                "verdict": row.get("verdict"), "actual_open": actual_open,
+                "actual_direction": actual_direction, "hit": hit, "captured_at": row.get("captured_at"),
+            })
+
+    scored = [r for r in out if r["actual_direction"] is not None and r["verdict"] is not None]
+    hit_rate = round(sum(1 for r in scored if r["hit"]) / len(scored) * 100, 1) if scored else None
+    return {"snapshots": out, "hit_rate_pct": hit_rate}
+
+
 @app.post("/api/premarket/paper-trades")
 async def create_paper_trade_endpoint(payload: dict):
     required = ["strike", "option_type", "action", "entry_price"]

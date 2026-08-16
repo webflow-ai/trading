@@ -112,6 +112,56 @@ def test_brief_history_computes_hit_rate_against_actual_next_day_open(monkeypatc
     assert body["briefs"][1]["hit"] is False
 
 
+# ---------------- top-10 movers ----------------
+
+def test_movers_snapshot_endpoint_persists_and_defaults_trade_date(monkeypatch):
+    captured = {}
+
+    async def fake_save_movers_snapshot(snapshot):
+        captured.update(snapshot)
+
+    monkeypatch.setattr(main_module.storage, "save_movers_snapshot", fake_save_movers_snapshot)
+
+    r = client.post("/api/premarket/movers/snapshot", json={
+        "implied_move_pct": 0.22, "verdict": "Gap-up likely", "stocks": [{"symbol": "RELIANCE"}],
+    })
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert captured["implied_move_pct"] == 0.22
+    assert captured["verdict"] == "Gap-up likely"
+    assert captured["trade_date"]  # defaulted to today's IST date, not passed explicitly
+
+
+def test_movers_accuracy_computes_hit_rate_against_actual_next_day_open(monkeypatch):
+    async def fake_get_movers_snapshots(days=30):
+        # newest-first, two snapshots for 2026-08-06 (latest should win) plus one for 2026-08-07
+        return [
+            {"trade_date": "2026-08-07", "verdict": "Gap-down likely", "implied_move_pct": -0.3, "captured_at": "t3"},
+            {"trade_date": "2026-08-06", "verdict": "Gap-up likely", "implied_move_pct": 0.4, "captured_at": "t2"},
+            {"trade_date": "2026-08-06", "verdict": "Flat open", "implied_move_pct": 0.05, "captured_at": "t1"},
+        ]
+
+    async def fake_nifty_close_on(trade_date, client):
+        return {"2026-08-06": 24500.0, "2026-08-07": 24500.0}[trade_date]
+
+    async def fake_actual_open_after(trade_date, client):
+        return {"2026-08-06": 24700.0, "2026-08-07": 24650.0}[trade_date]  # both actually went up
+
+    monkeypatch.setattr(main_module.storage, "get_movers_snapshots", fake_get_movers_snapshots)
+    monkeypatch.setattr(main_module, "_nifty_close_on", fake_nifty_close_on)
+    monkeypatch.setattr(main_module, "_actual_open_after", fake_actual_open_after)
+
+    r = client.get("/api/premarket/movers/accuracy", params={"days": 30})
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["snapshots"]) == 2  # deduped to one row per trade_date
+    by_date = {s["trade_date"]: s for s in body["snapshots"]}
+    assert by_date["2026-08-06"]["verdict"] == "Gap-up likely"  # the newest-first row for that date, not the older one
+    assert by_date["2026-08-06"]["hit"] is True
+    assert by_date["2026-08-07"]["hit"] is False  # predicted down, actually went up
+    assert body["hit_rate_pct"] == 50.0
+
+
 def test_fii_trend_endpoint_passes_through_days(monkeypatch):
     async def fake_get_fii_trend(days=30):
         return [{"trade_date": "2026-08-10", "future_index_long": 1, "future_index_short": 1}]

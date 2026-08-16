@@ -23,6 +23,7 @@ Yahoo-Finance-backed /api/candles route doesn't have this problem.
 
 import os
 import json
+import asyncio
 import datetime as dt
 
 import httpx
@@ -521,6 +522,435 @@ async def upstox_optionchain(symbol: str = Query("NIFTY"), expiry: str = Query(N
         })
     rows.sort(key=lambda r: r["strike"] if r["strike"] is not None else 0)
     return {"connected": True, "symbol": symbol, "expiry": expiry, "spot": spot, "rows": rows}
+
+
+# ---------------- Top-10 Nifty movers (index-weighted contribution) ----------------
+# weight_pct is each stock's approximate share of the Nifty 50 free-float
+# market-cap index, per NSE's published index factsheet -- NSE revises these
+# quarterly and there's no free live API for them, so this is a static
+# snapshot that will drift out of date over time (flagged here rather than
+# silently treated as authoritative; re-check against the current factsheet
+# periodically). instrument_key uses Upstox's documented NSE_EQ|<ISIN>
+# format -- ISINs themselves don't change, but this endpoint (like
+# upstox_optionchain above) hasn't been exercised against a live response
+# yet, so verify field names once actually connected.
+NIFTY_TOP10 = [
+    {"symbol": "HDFCBANK", "name": "HDFC Bank", "isin": "INE040A01034", "weight_pct": 13.0},
+    {"symbol": "ICICIBANK", "name": "ICICI Bank", "isin": "INE090A01021", "weight_pct": 8.7},
+    {"symbol": "RELIANCE", "name": "Reliance Industries", "isin": "INE002A01018", "weight_pct": 8.5},
+    {"symbol": "INFY", "name": "Infosys", "isin": "INE009A01021", "weight_pct": 5.7},
+    {"symbol": "ITC", "name": "ITC", "isin": "INE154A01025", "weight_pct": 4.3},
+    {"symbol": "TCS", "name": "Tata Consultancy Services", "isin": "INE467B01029", "weight_pct": 4.0},
+    {"symbol": "LT", "name": "Larsen & Toubro", "isin": "INE018A01030", "weight_pct": 3.9},
+    {"symbol": "BHARTIARTL", "name": "Bharti Airtel", "isin": "INE397D01024", "weight_pct": 3.8},
+    {"symbol": "AXISBANK", "name": "Axis Bank", "isin": "INE238A01034", "weight_pct": 3.3},
+    {"symbol": "KOTAKBANK", "name": "Kotak Mahindra Bank", "isin": "INE237A01036", "weight_pct": 3.0},
+]
+
+# Chosen default, same caveat as scoring.py's calibration constants: wider
+# than the 0.1% dead zone brief_history uses to classify an *actual* Nifty
+# open, since this reads only ~58% of the index's weight (these 10 stocks'
+# weight_pct sum) as a proxy for the whole -- a noisier signal deserves a
+# wider "flat" band before calling a direction. Untested against real
+# outcomes yet; retune once movers/accuracy history exists to compare against.
+MOVERS_VERDICT_THRESHOLD_PCT = 0.15
+
+
+def _movers_verdict(implied_move_pct: float | None) -> str | None:
+    if implied_move_pct is None:
+        return None
+    if implied_move_pct > MOVERS_VERDICT_THRESHOLD_PCT:
+        return "Gap-up likely"
+    if implied_move_pct < -MOVERS_VERDICT_THRESHOLD_PCT:
+        return "Gap-down likely"
+    return "Flat open"
+
+
+@app.get("/api/upstox/movers")
+async def upstox_movers():
+    """Live top-10-by-weight Nifty constituents, each stock's %change since
+    previous close, and an "implied index move" = sum(weight_pct *
+    pct_change) across the ten -- a weighted-contribution proxy for how much
+    of today's Nifty move these heaviest names explain, not the actual index
+    change itself (the other ~40 constituents aren't read here). Verdict
+    reuses the same three-way labels as the morning brief's scoring.py
+    ("Gap-up likely" / "Flat open" / "Gap-down likely") for one consistent
+    vocabulary across the dashboard, but this is a separate, much simpler
+    calculation -- it has no GIFT/macro/FII/news inputs, just these 10
+    stocks' live price action.
+
+    Requires a connected Upstox session (see /api/upstox/login), same as
+    upstox_optionchain -- there's no NSE-scrape fallback for per-stock LTPs
+    like there is for the option chain, so this degrades to
+    connected:false rather than silently guessing.
+    """
+    token = await load_upstox_token()
+    if not token:
+        return {
+            "connected": False, "stocks": [], "implied_move_pct": None, "verdict": None,
+            "error": "Upstox not connected — visit /api/upstox/login",
+        }
+
+    instrument_keys = ",".join(f"NSE_EQ|{s['isin']}" for s in NIFTY_TOP10)
+    try:
+        async with httpx.AsyncClient(timeout=10) as up_client:
+            resp = await up_client.get(
+                "https://api.upstox.com/v2/market-quote/quotes",
+                params={"instrument_key": instrument_keys},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+    except Exception as e:
+        return {
+            "connected": True, "stocks": [], "implied_move_pct": None, "verdict": None,
+            "error": f"upstox request failed: {e}",
+        }
+
+    if resp.status_code == 401:
+        await clear_upstox_token()
+        return {
+            "connected": False, "stocks": [], "implied_move_pct": None, "verdict": None,
+            "error": "Upstox session expired — visit /api/upstox/login again",
+        }
+    if resp.status_code != 200:
+        return {
+            "connected": True, "stocks": [], "implied_move_pct": None, "verdict": None,
+            "error": f"upstox returned {resp.status_code}: {resp.text[:200]}",
+        }
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        return {
+            "connected": True, "stocks": [], "implied_move_pct": None, "verdict": None,
+            "error": f"upstox returned non-JSON: {e}",
+        }
+
+    # Matched by each quote's own instrument_token field rather than the
+    # outer dict key -- Upstox's documented key format for this endpoint
+    # ("NSE_EQ:SYMBOL" vs the instrument_key we sent) isn't confirmed live,
+    # so trusting the key shape would be the same kind of guess
+    # upstox_optionchain's docstring already warns against.
+    by_key = {}
+    for quote in (payload.get("data") or {}).values():
+        token_field = quote.get("instrument_token")
+        if token_field:
+            by_key[token_field] = quote
+
+    stocks = []
+    total_contribution = 0.0
+    any_live = False
+    for s in NIFTY_TOP10:
+        q = by_key.get(f"NSE_EQ|{s['isin']}")
+        ltp = q.get("last_price") if q else None
+        prev_close = (q.get("ohlc") or {}).get("close") if q else None
+        pct_change = (ltp - prev_close) / prev_close * 100 if ltp is not None and prev_close else None
+        contribution = (pct_change * s["weight_pct"] / 100) if pct_change is not None else None
+        if contribution is not None:
+            total_contribution += contribution
+            any_live = True
+        stocks.append({
+            "symbol": s["symbol"], "name": s["name"], "weight_pct": s["weight_pct"],
+            "ltp": ltp, "prev_close": prev_close, "pct_change": pct_change, "contribution_pct": contribution,
+        })
+
+    implied_move_pct = round(total_contribution, 3) if any_live else None
+    return {
+        "connected": True, "stocks": stocks,
+        "implied_move_pct": implied_move_pct, "verdict": _movers_verdict(implied_move_pct),
+    }
+
+
+# Upstox's v2 intraday-candle API only accepts "1minute"/"30minute" (confirmed
+# live -- 5/15 minute both come back UDAPI1076 "Interval accepts one of
+# (1minute,30minute)"). v3's intraday/historical-candle endpoints take a
+# separate unit+number instead of one combined string and support finer
+# granularities -- verified live for minutes/1, minutes/5, minutes/15,
+# minutes/30, and days/1 -- so v3 is what's actually called below; this
+# dict is just this repo's own "1minute"-style query-param spelling mapped
+# to v3's (unit, number) pair.
+UPSTOX_INTRADAY_INTERVALS = {"1minute": ("minutes", 1), "5minute": ("minutes", 5), "15minute": ("minutes", 15), "30minute": ("minutes", 30)}
+DAILY_FALLBACK_LOOKBACK_DAYS = 10  # calendar days, not trading days -- comfortably covers a weekend/holiday gap
+
+
+def _parse_candles(payload: dict) -> list[dict]:
+    """Upstox candle row: [timestamp, open, high, low, close, volume, oi],
+    documented as most-recent-first -- reversed here for a left-to-right
+    chart. Full OHLC plus volume is kept (not just close) so the frontend
+    can render a real candlestick + volume-histogram chart (lightweight-
+    charts, see premarket.jsx's LightweightChart) from the same series.
+    volume is optional (None if the row is shorter than expected) --
+    everything downstream already treats a missing volume as "no volume
+    panel for this point" rather than erroring. Shared by both the
+    intraday and daily-fallback fetchers below since both endpoints return
+    the same row shape."""
+    candles = (payload.get("data") or {}).get("candles") or []
+    points = [
+        {
+            "t": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4],
+            "volume": c[5] if len(c) > 5 else None,
+        }
+        for c in candles if isinstance(c, list) and len(c) >= 5
+    ]
+    points.reverse()
+    return points
+
+
+async def _fetch_stock_history(token: str, isin: str, interval: str) -> list[dict]:
+    """One stock's price history, oldest-first, as {t, close} points ready
+    for an area chart. Upstox has no batch historical-candle endpoint
+    (unlike market-quote/quotes above), so getting all 10 movers' history
+    means one request per stock -- callers should run these via
+    asyncio.gather rather than sequentially awaiting each one.
+
+    Tries today's intraday candles first; Upstox returns `candles: []`
+    (success, not an error) rather than a fallback of its own when the
+    market hasn't traded yet today (weekend, holiday, or simply before
+    open) -- confirmed live. Rather than surface an empty chart in that
+    common case, this falls back to the last ~10 calendar days of daily
+    closes via Upstox's historical-candle range endpoint, so there's
+    usually still a real chart to show. Not a like-for-like substitute for
+    intraday (daily granularity, multi-day span instead of one session) --
+    just better than blank.
+
+    Never raises: any failure (network, non-200, unexpected shape) at
+    either step just returns an empty list for that one stock, same
+    degrade-per-row convention as upstox_movers/upstox_nifty50 above -- one
+    stock's history being unavailable shouldn't blank out the other nine.
+    """
+    instrument_key = f"NSE_EQ|{isin}"
+    unit, number = UPSTOX_INTRADAY_INTERVALS[interval]
+    try:
+        async with httpx.AsyncClient(timeout=10) as up_client:
+            resp = await up_client.get(
+                f"https://api.upstox.com/v3/historical-candle/intraday/{instrument_key}/{unit}/{number}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        if resp.status_code == 200:
+            points = _parse_candles(resp.json())
+            if points:
+                return points
+    except Exception:
+        pass
+
+    to_date = dt.date.today().isoformat()
+    from_date = (dt.date.today() - dt.timedelta(days=DAILY_FALLBACK_LOOKBACK_DAYS)).isoformat()
+    try:
+        async with httpx.AsyncClient(timeout=10) as up_client:
+            resp = await up_client.get(
+                f"https://api.upstox.com/v3/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        if resp.status_code != 200:
+            return []
+        return _parse_candles(resp.json())
+    except Exception:
+        return []
+
+
+@app.get("/api/upstox/movers/history")
+async def upstox_movers_history(interval: str = Query("30minute")):
+    """Price history for each of NIFTY_TOP10, for the movers panel's area
+    charts -- a heavier call than /api/upstox/movers (one Upstox request
+    per stock, run in parallel via asyncio.gather), so the frontend should
+    poll this on a much slower cadence than the live-quote endpoint. See
+    _fetch_stock_history's own docstring for the intraday-vs-daily-fallback
+    behavior.
+    """
+    if interval not in UPSTOX_INTRADAY_INTERVALS:
+        return {"connected": True, "series": {}, "error": f"interval must be one of {sorted(UPSTOX_INTRADAY_INTERVALS)}"}
+
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "series": {}, "error": "Upstox not connected — visit /api/upstox/login"}
+
+    results = await asyncio.gather(*(_fetch_stock_history(token, s["isin"], interval) for s in NIFTY_TOP10))
+    series = {s["symbol"]: points for s, points in zip(NIFTY_TOP10, results)}
+    return {"connected": True, "series": series}
+
+
+@app.get("/api/upstox/stock/history")
+async def upstox_stock_history(symbol: str = Query(...), interval: str = Query("30minute")):
+    """One stock's price history at a caller-chosen interval -- lighter
+    than /api/upstox/movers/history, which always fetches all 10 stocks at
+    once for the sparkline grid. Built for the movers modal's interval
+    picker (5m/15m/30m): when the user switches granularity for the one
+    stock they have open, there's no reason to re-fetch the other nine.
+    Only serves NIFTY_TOP10 symbols today, matching the modal's only
+    caller -- extend this if another panel ever needs a single-stock chart.
+    """
+    symbol = symbol.upper()
+    if interval not in UPSTOX_INTRADAY_INTERVALS:
+        return {"connected": True, "points": [], "error": f"interval must be one of {sorted(UPSTOX_INTRADAY_INTERVALS)}"}
+
+    stock = next((s for s in NIFTY_TOP10 if s["symbol"] == symbol), None)
+    if not stock:
+        return {"connected": True, "points": [], "error": f"unknown symbol: {symbol}"}
+
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "points": [], "error": "Upstox not connected — visit /api/upstox/login"}
+
+    return {"connected": True, "points": await _fetch_stock_history(token, stock["isin"], interval)}
+
+
+# ---------------- Full Nifty 50 constituent board (unweighted) ----------------
+# Best-effort snapshot of current Nifty 50 membership, symbol/ISIN pairs
+# only -- unlike NIFTY_TOP10 above, this deliberately carries no per-stock
+# weight_pct. Reliable weight figures are only really known with confidence
+# for the heaviest names already in NIFTY_TOP10; assigning precise-looking
+# weights to all 50 from memory would be false precision. This board reports
+# plain price action (gainers/losers/breadth) instead of a weighted implied
+# move.
+#
+# ⚠️ Membership itself is a bigger risk here than in NIFTY_TOP10: NSE
+# reconstitutes the index semi-annually (index reviews add/drop names), and
+# this list of *which 50 names* was built without a live fetch of the
+# current factsheet -- some entries may be stale (a recently added
+# constituent missing, a recently dropped one still listed).
+#
+# The symbol/ISIN pairs themselves, however, HAVE been verified: cross-
+# checked against Upstox's own published NSE instrument master
+# (assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz) on
+# 2026-08-16, which caught and fixed 7 real errors from the original
+# from-memory list -- 5 stale ISINs (KOTAKBANK, BAJFINANCE, BAJAJFINSV,
+# DRREDDY, SHRIRAMFIN all had a transposed/wrong final digit or two) and 2
+# renamed trading symbols Upstox no longer recognizes under their old name
+# (TATAMOTORS demerged into TMCV/TMPV -- the Nifty 50 constituent is the
+# passenger-vehicle entity, TMPV, which kept the original ISIN; LTIM's
+# trading symbol on Upstox is now LTM). Each entry still degrades
+# independently if wrong (a bad/delisted ISIN just returns null data for
+# that one row via the by_key lookup below, same as NIFTY_TOP10's own
+# convention), so a handful of remaining membership errors won't break the
+# rest of the board -- but re-verify against nseindia.com's current Nifty
+# 50 factsheet before trusting the list is complete, since that's the one
+# thing this check didn't cover.
+NIFTY50_EXTRA = [
+    {"symbol": "SBIN", "name": "State Bank of India", "isin": "INE062A01020"},
+    {"symbol": "HINDUNILVR", "name": "Hindustan Unilever", "isin": "INE030A01027"},
+    {"symbol": "BAJFINANCE", "name": "Bajaj Finance", "isin": "INE296A01032"},
+    {"symbol": "SUNPHARMA", "name": "Sun Pharmaceutical", "isin": "INE044A01036"},
+    {"symbol": "MARUTI", "name": "Maruti Suzuki", "isin": "INE585B01010"},
+    {"symbol": "M&M", "name": "Mahindra & Mahindra", "isin": "INE101A01026"},
+    {"symbol": "NTPC", "name": "NTPC", "isin": "INE733E01010"},
+    {"symbol": "HCLTECH", "name": "HCL Technologies", "isin": "INE860A01027"},
+    {"symbol": "TITAN", "name": "Titan Company", "isin": "INE280A01028"},
+    {"symbol": "TMPV", "name": "Tata Motors Passenger Vehicles", "isin": "INE155A01022"},
+    {"symbol": "ULTRACEMCO", "name": "UltraTech Cement", "isin": "INE481G01011"},
+    {"symbol": "POWERGRID", "name": "Power Grid Corp", "isin": "INE752E01010"},
+    {"symbol": "ASIANPAINT", "name": "Asian Paints", "isin": "INE021A01026"},
+    {"symbol": "BAJAJFINSV", "name": "Bajaj Finserv", "isin": "INE918I01026"},
+    {"symbol": "WIPRO", "name": "Wipro", "isin": "INE075A01022"},
+    {"symbol": "NESTLEIND", "name": "Nestle India", "isin": "INE239A01024"},
+    {"symbol": "ADANIENT", "name": "Adani Enterprises", "isin": "INE423A01024"},
+    {"symbol": "ADANIPORTS", "name": "Adani Ports & SEZ", "isin": "INE742F01042"},
+    {"symbol": "JSWSTEEL", "name": "JSW Steel", "isin": "INE019A01038"},
+    {"symbol": "TATASTEEL", "name": "Tata Steel", "isin": "INE081A01020"},
+    {"symbol": "GRASIM", "name": "Grasim Industries", "isin": "INE047A01021"},
+    {"symbol": "COALINDIA", "name": "Coal India", "isin": "INE522F01014"},
+    {"symbol": "BAJAJ-AUTO", "name": "Bajaj Auto", "isin": "INE917I01010"},
+    {"symbol": "TECHM", "name": "Tech Mahindra", "isin": "INE669C01036"},
+    {"symbol": "HINDALCO", "name": "Hindalco Industries", "isin": "INE038A01020"},
+    {"symbol": "DRREDDY", "name": "Dr Reddy's Laboratories", "isin": "INE089A01031"},
+    {"symbol": "CIPLA", "name": "Cipla", "isin": "INE059A01026"},
+    {"symbol": "EICHERMOT", "name": "Eicher Motors", "isin": "INE066A01021"},
+    {"symbol": "BRITANNIA", "name": "Britannia Industries", "isin": "INE216A01030"},
+    {"symbol": "HEROMOTOCO", "name": "Hero MotoCorp", "isin": "INE158A01026"},
+    {"symbol": "APOLLOHOSP", "name": "Apollo Hospitals", "isin": "INE437A01024"},
+    {"symbol": "DIVISLAB", "name": "Divi's Laboratories", "isin": "INE361B01024"},
+    {"symbol": "SBILIFE", "name": "SBI Life Insurance", "isin": "INE123W01016"},
+    {"symbol": "HDFCLIFE", "name": "HDFC Life Insurance", "isin": "INE795G01014"},
+    {"symbol": "INDUSINDBK", "name": "IndusInd Bank", "isin": "INE095A01012"},
+    {"symbol": "SHRIRAMFIN", "name": "Shriram Finance", "isin": "INE721A01047"},
+    {"symbol": "TATACONSUM", "name": "Tata Consumer Products", "isin": "INE192A01025"},
+    {"symbol": "ONGC", "name": "Oil & Natural Gas Corp", "isin": "INE213A01029"},
+    {"symbol": "TRENT", "name": "Trent", "isin": "INE849A01020"},
+    {"symbol": "LTM", "name": "LTIMindtree", "isin": "INE214T01019"},
+]
+# NIFTY_TOP10 entries repeated here (minus weight_pct) so the board is the
+# full ~50, not 40 -- this is the single source of truth for "which 50",
+# NIFTY_TOP10 stays the source of truth for "how much each of its 10 is
+# weighted".
+NIFTY50_ALL = [{"symbol": s["symbol"], "name": s["name"], "isin": s["isin"]} for s in NIFTY_TOP10] + NIFTY50_EXTRA
+
+
+@app.get("/api/upstox/nifty50")
+async def upstox_nifty50():
+    """Live price action for all ~50 Nifty constituents (see NIFTY50_ALL's
+    own caveat above about membership/ISIN staleness) -- a market-breadth
+    board (advances/declines, sorted by %change) to complement
+    /api/upstox/movers' weighted top-10 predictor, not a replacement for it.
+    Same connected-session requirement and degrade-gracefully-per-row
+    behavior as upstox_movers above; no NSE fallback exists for per-stock
+    LTPs, so this is Upstox-only.
+    """
+    token = await load_upstox_token()
+    if not token:
+        return {
+            "connected": False, "stocks": [], "advances": None, "declines": None, "unchanged": None,
+            "error": "Upstox not connected — visit /api/upstox/login",
+        }
+
+    instrument_keys = ",".join(f"NSE_EQ|{s['isin']}" for s in NIFTY50_ALL)
+    try:
+        async with httpx.AsyncClient(timeout=15) as up_client:
+            resp = await up_client.get(
+                "https://api.upstox.com/v2/market-quote/quotes",
+                params={"instrument_key": instrument_keys},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+    except Exception as e:
+        return {
+            "connected": True, "stocks": [], "advances": None, "declines": None, "unchanged": None,
+            "error": f"upstox request failed: {e}",
+        }
+
+    if resp.status_code == 401:
+        await clear_upstox_token()
+        return {
+            "connected": False, "stocks": [], "advances": None, "declines": None, "unchanged": None,
+            "error": "Upstox session expired — visit /api/upstox/login again",
+        }
+    if resp.status_code != 200:
+        return {
+            "connected": True, "stocks": [], "advances": None, "declines": None, "unchanged": None,
+            "error": f"upstox returned {resp.status_code}: {resp.text[:200]}",
+        }
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        return {
+            "connected": True, "stocks": [], "advances": None, "declines": None, "unchanged": None,
+            "error": f"upstox returned non-JSON: {e}",
+        }
+
+    by_key = {}
+    for quote in (payload.get("data") or {}).values():
+        token_field = quote.get("instrument_token")
+        if token_field:
+            by_key[token_field] = quote
+
+    stocks = []
+    advances = declines = unchanged = 0
+    for s in NIFTY50_ALL:
+        q = by_key.get(f"NSE_EQ|{s['isin']}")
+        ltp = q.get("last_price") if q else None
+        prev_close = (q.get("ohlc") or {}).get("close") if q else None
+        pct_change = (ltp - prev_close) / prev_close * 100 if ltp is not None and prev_close else None
+        if pct_change is not None:
+            if pct_change > 0:
+                advances += 1
+            elif pct_change < 0:
+                declines += 1
+            else:
+                unchanged += 1
+        stocks.append({
+            "symbol": s["symbol"], "name": s["name"],
+            "ltp": ltp, "prev_close": prev_close, "pct_change": pct_change,
+        })
+    stocks.sort(key=lambda r: (r["pct_change"] is None, -(r["pct_change"] or 0)))
+
+    return {"connected": True, "stocks": stocks, "advances": advances, "declines": declines, "unchanged": unchanged}
 
 
 async def fetch_and_record_pcr(symbol: str, now: dt.datetime, persist_strikes: bool = False) -> dict:

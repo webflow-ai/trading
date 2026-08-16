@@ -382,3 +382,30 @@ def test_get_paper_trade_returns_none_when_not_found(monkeypatch):
     monkeypatch.setattr(storage, "get_client", fake_get_client)
 
     assert asyncio.run(storage.get_paper_trade(999)) is None
+
+
+# ---------------- top-10 movers accuracy tracking ----------------
+
+def test_save_movers_snapshot_inserts_row(fake_client):
+    asyncio.run(storage.save_movers_snapshot({
+        "trade_date": "2026-08-14", "implied_move_pct": 0.22, "verdict": "Gap-up likely", "stocks": [],
+    }))
+
+    method, url, kwargs = fake_client.calls[0]
+    assert method == "POST"
+    assert url.endswith("/rest/v1/movers_snapshots")
+    assert kwargs["json"]["implied_move_pct"] == 0.22
+
+
+def test_get_movers_snapshots_orders_newest_first(monkeypatch):
+    client = FakeAsyncClient(get_response=FakeResponse([{"trade_date": "2026-08-14"}]))
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    result = asyncio.run(storage.get_movers_snapshots(days=30))
+
+    assert result == [{"trade_date": "2026-08-14"}]
+    method, url, kwargs = client.calls[0]
+    assert kwargs["params"] == {"order": "captured_at.desc", "limit": "1500"}
