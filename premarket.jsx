@@ -422,15 +422,24 @@ const MOVERS_HISTORY_POLL_MS = 60000;
 // sync with whatever interval the panel is actually polling at (it did,
 // briefly: both were hardcoded to "30minute" separately until this).
 const MOVERS_HISTORY_DEFAULT_INTERVAL = "5minute";
-const MOVE_ALERT_DEFAULT_THRESHOLD_PTS = 30;
+// Threshold for the *current 5-minute window's* implied move (see
+// implied5MinPoints in MoversPanel), not the day-cumulative implied move --
+// naturally smaller than a full-day figure, so this default is lower than
+// it would be for that. Chosen to sit below the backtest panel's 50pt
+// "big event" threshold (this alert is meant to catch ordinary single-bar
+// moves, not just the rare large ones already validated at ~85% direction
+// accuracy there).
+const MOVE_ALERT_DEFAULT_THRESHOLD_PTS = 20;
 
 // Non-blocking toast (not a modal -- it shouldn't interrupt whatever the
-// user's doing) shown when the live top-10 weighted signal crosses
-// alertThresholdPts, converted to real Nifty points via api/index.py's
-// implied_points (weight% x %change scaled by NIFTY's own live LTP, not a
-// raw percentage). Fires once per *new* direction, not on every 5s poll
-// tick the condition happens to still hold -- see MoversPanel's
-// lastAlertDirectionRef for the de-dup logic.
+// user's doing) shown when MoversPanel's implied5MinPoints -- the top-10
+// weighted move within the *current 5-minute window* (not the day-
+// cumulative implied_points from api/index.py) -- crosses alertThresholdPts.
+// Deliberately scoped to one bar's move, matching what the backtest panel
+// actually measures (single 5-min-bar moves), rather than the day-open-to-
+// now figure shown elsewhere on this panel. Fires once per *new* direction,
+// not on every 5s poll tick the condition happens to still hold -- see
+// MoversPanel's lastAlertDirectionRef for the de-dup logic.
 function MoveAlertToast({ alert, onDismiss }) {
   if (!alert) return null;
   const color = alert.direction === "up" ? T.put : T.call;
@@ -445,13 +454,13 @@ function MoveAlertToast({ alert, onDismiss }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
         <div>
           <div style={{ fontFamily: DISP, fontSize: 13, fontWeight: 700, color }}>
-            {alert.direction === "up" ? "📈" : "📉"} Possible ≥{alert.thresholdPts}pt {alert.direction === "up" ? "rise" : "fall"}
+            {alert.direction === "up" ? "📈" : "📉"} Possible ≥{alert.thresholdPts}pt {alert.direction === "up" ? "rise" : "fall"} — this 5-min window
           </div>
           <div style={{ fontFamily: MONO, fontSize: 13, color: T.fg, marginTop: 6 }}>
-            Implied ~{fmtSigned(alert.impliedPts, 0)} pts ({fmtSigned(alert.impliedPct, 3)}%) from top-10 weighted signal
+            Implied ~{fmtSigned(alert.impliedPts, 0)} pts ({fmtSigned(alert.impliedPct, 3)}%) from top-10 weighted signal, since this bar opened
           </div>
           <div style={{ fontFamily: DISP, fontSize: 10, color: T.muted, marginTop: 8, lineHeight: 1.4 }}>
-            Live pattern, not a guarantee — same weighted-contribution formula the backtest panel below scored ~85% directionally accurate.
+            Live pattern, not a guarantee — same weighted-contribution formula the backtest panel below scored ~85% directionally accurate on single 5-min-bar moves.
           </div>
         </div>
         <button
@@ -752,19 +761,6 @@ function MoversPanel() {
         const json = await res.json();
         setData(json);
 
-        if (json.connected && json.implied_points != null) {
-          const direction = json.implied_points >= alertThresholdPts ? "up"
-            : json.implied_points <= -alertThresholdPts ? "down" : null;
-          if (direction && direction !== lastAlertDirectionRef.current) {
-            lastAlertDirectionRef.current = direction;
-            setActiveAlert({
-              direction, impliedPts: json.implied_points, impliedPct: json.implied_move_pct, thresholdPts: alertThresholdPts,
-            });
-          } else if (!direction) {
-            lastAlertDirectionRef.current = null; // condition cleared -- ready to fire again if it returns
-          }
-        }
-
         const now = Date.now();
         if (json.connected && json.implied_move_pct != null && now - lastSnapshotAt.current > MOVERS_SNAPSHOT_THROTTLE_MS) {
           lastSnapshotAt.current = now;
@@ -782,7 +778,7 @@ function MoversPanel() {
     tick();
     const id = setInterval(tick, MOVERS_POLL_MS);
     return () => clearInterval(id);
-  }, [loadAccuracy, alertThresholdPts]);
+  }, [loadAccuracy]);
 
   useEffect(() => {
     const tick = async () => {
@@ -801,6 +797,47 @@ function MoversPanel() {
     const id = setInterval(tick, MOVERS_HISTORY_POLL_MS);
     return () => clearInterval(id);
   }, []);
+
+  // "Right now, in the last 5 minutes" -- NOT the same thing as
+  // data.implied_points (which measures cumulative move since the
+  // previous day's close, i.e. "how the day has gone so far"). This is
+  // the metric that actually matches what the backtest panel validates:
+  // each stock's %change over one 5-min bar, weight-summed. The anchor is
+  // the *open* of the freshest 5-min candle in `history` (last polled up
+  // to MOVERS_HISTORY_POLL_MS ago, and Upstox includes the still-forming
+  // candle so that open is a stable "start of this window" price) against
+  // the *current* LTP from `data` (refreshed every MOVERS_POLL_MS) -- so
+  // this updates every 5s even though the candle data itself only refreshes
+  // once a minute.
+  const implied5MinPct = useMemo(() => {
+    if (!data?.stocks || !history?.series) return null;
+    let total = 0;
+    let any = false;
+    for (const s of data.stocks) {
+      const candles = history.series[s.symbol];
+      const windowOpen = candles?.[candles.length - 1]?.open;
+      if (!windowOpen || s.ltp == null) continue;
+      total += (s.ltp - windowOpen) / windowOpen * 100 * s.weight_pct / 100;
+      any = true;
+    }
+    return any ? total : null;
+  }, [data, history]);
+
+  const implied5MinPoints = useMemo(() => (
+    implied5MinPct != null && data?.nifty_spot ? implied5MinPct / 100 * data.nifty_spot : null
+  ), [implied5MinPct, data?.nifty_spot]);
+
+  useEffect(() => {
+    if (implied5MinPoints == null) return;
+    const direction = implied5MinPoints >= alertThresholdPts ? "up"
+      : implied5MinPoints <= -alertThresholdPts ? "down" : null;
+    if (direction && direction !== lastAlertDirectionRef.current) {
+      lastAlertDirectionRef.current = direction;
+      setActiveAlert({ direction, impliedPts: implied5MinPoints, impliedPct: implied5MinPct, thresholdPts: alertThresholdPts });
+    } else if (!direction) {
+      lastAlertDirectionRef.current = null; // condition cleared -- ready to fire again if it returns
+    }
+  }, [implied5MinPoints, implied5MinPct, alertThresholdPts]);
 
   const chartData = useMemo(() => {
     return (data?.stocks || [])
@@ -823,10 +860,10 @@ function MoversPanel() {
               </span>
             )}
             <label
-              title="Pop up a live alert whenever the implied move crosses this many Nifty points, in either direction"
+              title="Pop up a live alert whenever the current 5-minute window's implied move crosses this many Nifty points, in either direction"
               style={{ fontFamily: DISP, fontSize: 11, color: T.muted, display: "flex", alignItems: "center", gap: 4 }}
             >
-              alert ≥ pts
+              alert ≥ pts / 5m
               <input
                 type="number" min="5" max="500" value={alertThresholdPts}
                 onChange={(e) => setAlertThresholdPts(Number(e.target.value) || MOVE_ALERT_DEFAULT_THRESHOLD_PTS)}
@@ -848,7 +885,7 @@ function MoversPanel() {
           <EmptyNote>{data?.error || "Upstox not connected — visit /api/upstox/login to see live movers."}</EmptyNote>
         ) : (
           <>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 14, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 24, marginBottom: 14, flexWrap: "wrap" }}>
               <div>
                 <div style={{ fontFamily: MONO, fontSize: 28, fontWeight: 700, color: directionColor(data.implied_move_pct) }}>
                   {fmtSigned(data.implied_move_pct, 2)}%
@@ -858,7 +895,20 @@ function MoversPanel() {
                     </span>
                   )}
                 </div>
-                <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>implied move from top-10 weight</div>
+                <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>implied move since open</div>
+              </div>
+              <div>
+                <div style={{ fontFamily: MONO, fontSize: 22, fontWeight: 700, color: directionColor(implied5MinPoints) }}>
+                  {implied5MinPoints != null ? `${fmtSigned(implied5MinPoints, 0)} pts` : "—"}
+                  {implied5MinPct != null && (
+                    <span style={{ fontSize: 13, marginLeft: 6, color: directionColor(implied5MinPct) }}>
+                      ({fmtSigned(implied5MinPct, 3)}%)
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }} title="This is what the alert popup and the backtest panel both measure — one 5-min bar's move, not the day-cumulative figure to the left">
+                  implied move, this 5-min window
+                </div>
               </div>
               {data.verdict && (
                 <Chip color={VERDICT_COLOR[data.verdict] || T.muted}>{VERDICT_EMOJI[data.verdict]} {data.verdict}</Chip>
