@@ -1105,6 +1105,290 @@ async def upstox_predictive():
     }
 
 
+# ---------------- SMC confluence setup: sweep + FVG + OB + structure ----------------
+# The week-long SMC backtest (scratch script, 2026-08-17) found none of
+# these patterns has a directional edge ALONE (FVG reaction 58.5%, OB
+# 55.6%, BOS/CHoCH 52%, sweeps 38.5% on n=13) -- but the structural
+# claims held (85% of FVGs fill, 77% of OBs get revisited). So this
+# detector only fires when >= SETUP_MIN_SCORE of the four candle factors
+# align in one direction ("confluence", the way these concepts are
+# actually traded), and -- the honesty mechanism -- the endpoint replays
+# the exact same rule over the trailing week every call and reports its
+# real, measured hit rate against the base rate of any random bar making
+# the same move. The panel shows earned accuracy, not claimed accuracy.
+SETUP_MIN_SCORE = 2
+SETUP_HORIZON_BARS = 6          # 30 minutes of 5-min bars
+SETUP_TARGETS_PTS = (10.0, 20.0)
+SETUP_ZONE_MAX_AGE_BARS = 48    # a zone (FVG/OB) older than ~4 hours is stale
+SETUP_SWEEP_FRESH_BARS = 3      # a sweep counts as "just happened" this many bars
+SETUP_COOLDOWN_BARS = 3         # don't refire while the same setup is still forming
+
+
+def _smc_fractal_swings(candles: list[dict], window: int = 2) -> list[dict]:
+    """Same fractal definition as technicals.py's _find_fractal_swings,
+    duplicated here keyed on this file's candle shape ({"t", ...} from
+    _parse_candles) rather than market_data's ({"dt", ...})."""
+    swings = []
+    for i in range(window, len(candles) - window):
+        c = candles[i]
+        highs = [candles[j]["high"] for j in range(i - window, i + window + 1) if j != i]
+        lows = [candles[j]["low"] for j in range(i - window, i + window + 1) if j != i]
+        if c["high"] > max(highs):
+            swings.append({"idx": i, "type": "high", "price": c["high"]})
+        elif c["low"] < min(lows):
+            swings.append({"idx": i, "type": "low", "price": c["low"]})
+    return swings
+
+
+def detect_confluence_setups(candles: list[dict], min_score: int = SETUP_MIN_SCORE) -> dict:
+    """Runs the confluence rule over the whole candle series and evaluates
+    every fired setup's outcome, so one call yields both the live state
+    (last bar) and the honestly-measured trailing hit rate for the exact
+    same rule. Pure function -- no network -- so it's directly testable.
+
+    The four factors per direction (bullish shown; bearish is the mirror):
+      1. sweep: a candle wicked below the last swing low but closed back
+         above it within the last SETUP_SWEEP_FRESH_BARS bars (sell-side
+         liquidity grab -> bullish fuel)
+      2. fvg: this bar trades into a still-active bullish FVG (3-candle
+         gap up, formed within SETUP_ZONE_MAX_AGE_BARS, not yet fully
+         filled) -- the "price returns to the gap, gap acts as support"
+         claim that measured 85% structurally
+      3. ob: this bar is the FIRST touch of an unmitigated bullish order
+         block (last bearish candle before an impulsive up-breakout)
+      4. bias: running BOS/CHoCH structure bias is bullish
+    """
+    n = len(candles)
+    swings = _smc_fractal_swings(candles)
+
+    # --- FVGs with their fill bar precomputed ---
+    fvgs = []
+    for i in range(2, n):
+        c1, c3 = candles[i - 2], candles[i]
+        if c1["high"] < c3["low"]:
+            fvgs.append({"type": "bullish", "top": c3["low"], "bottom": c1["high"], "formed_idx": i, "fill_idx": None})
+        elif c1["low"] > c3["high"]:
+            fvgs.append({"type": "bearish", "top": c1["low"], "bottom": c3["high"], "formed_idx": i, "fill_idx": None})
+    for f in fvgs:
+        for j in range(f["formed_idx"] + 1, min(f["formed_idx"] + SETUP_ZONE_MAX_AGE_BARS + 1, n)):
+            filled = candles[j]["low"] <= f["bottom"] if f["type"] == "bullish" else candles[j]["high"] >= f["top"]
+            if filled:
+                f["fill_idx"] = j
+                break
+
+    # --- Order blocks with their first-touch bar precomputed ---
+    obs = []
+    for i in range(20, n):
+        avg_body = sum(abs(candles[j]["close"] - candles[j]["open"]) for j in range(i - 20, i)) / 20
+        c = candles[i]
+        body = c["close"] - c["open"]
+        prior_closes = [candles[j]["close"] for j in range(i - 10, i)]
+        impulsive_up = body > 0 and abs(body) >= 1.5 * avg_body and c["close"] > max(prior_closes)
+        impulsive_down = body < 0 and abs(body) >= 1.5 * avg_body and c["close"] < min(prior_closes)
+        if not (impulsive_up or impulsive_down):
+            continue
+        want_bearish_candle = impulsive_up  # the OB is the last opposite-colored candle before the impulse
+        for k in range(i - 1, max(i - 5, -1), -1):
+            opposite = candles[k]["close"] < candles[k]["open"] if want_bearish_candle else candles[k]["close"] > candles[k]["open"]
+            if opposite:
+                obs.append({
+                    "type": "bullish" if impulsive_up else "bearish",
+                    "low": candles[k]["low"], "high": candles[k]["high"],
+                    "formed_idx": i, "touch_idx": None,
+                })
+                break
+    for ob in obs:
+        for j in range(ob["formed_idx"] + 1, min(ob["formed_idx"] + SETUP_ZONE_MAX_AGE_BARS + 1, n)):
+            if candles[j]["low"] <= ob["high"] and candles[j]["high"] >= ob["low"]:
+                ob["touch_idx"] = j
+                break
+
+    # --- Liquidity sweeps + running structure bias, one forward walk ---
+    sweeps = []          # {"idx", "type": "buy_side"|"sell_side", "level"}
+    bias_at = ["neutral"] * n
+    bias = "neutral"
+    last_swing_high = last_swing_low = None
+    swing_iter = iter(swings)
+    next_swing = next(swing_iter, None)
+    for i, c in enumerate(candles):
+        while next_swing is not None and next_swing["idx"] < i:
+            if next_swing["type"] == "high":
+                last_swing_high = next_swing["price"]
+            else:
+                last_swing_low = next_swing["price"]
+            next_swing = next(swing_iter, None)
+        if last_swing_high is not None and c["high"] > last_swing_high:
+            if c["close"] < last_swing_high:
+                sweeps.append({"idx": i, "type": "buy_side", "level": last_swing_high})
+            else:
+                bias = "bullish"
+            last_swing_high = None
+        if last_swing_low is not None and c["low"] < last_swing_low:
+            if c["close"] > last_swing_low:
+                sweeps.append({"idx": i, "type": "sell_side", "level": last_swing_low})
+            else:
+                bias = "bearish"
+            last_swing_low = None
+        bias_at[i] = bias
+
+    def factors_at(i: int) -> dict:
+        c = candles[i]
+        out = {"bullish": [], "bearish": []}
+        for sw in sweeps:
+            if i - SETUP_SWEEP_FRESH_BARS <= sw["idx"] <= i:
+                side = "bullish" if sw["type"] == "sell_side" else "bearish"
+                ago = i - sw["idx"]
+                out[side].append(f"{sw['type'].replace('_', '-')} liquidity swept at {sw['level']:.0f} ({ago} bar{'s' if ago != 1 else ''} ago)")
+        for f in fvgs:
+            if not (f["formed_idx"] < i <= f["formed_idx"] + SETUP_ZONE_MAX_AGE_BARS):
+                continue
+            if f["fill_idx"] is not None and i > f["fill_idx"]:
+                continue
+            if c["low"] <= f["top"] and c["high"] >= f["bottom"]:
+                out[f["type"]].append(f"price trading into {f['type']} FVG {f['bottom']:.0f}–{f['top']:.0f}")
+        for ob in obs:
+            if ob["touch_idx"] == i and i - ob["formed_idx"] <= SETUP_ZONE_MAX_AGE_BARS:
+                out[ob["type"]].append(f"first touch of {ob['type']} order block {ob['low']:.0f}–{ob['high']:.0f}")
+        if bias_at[i] in ("bullish", "bearish"):
+            out[bias_at[i]].append(f"structure bias {bias_at[i]}")
+        return out
+
+    # --- Fire + evaluate ---
+    fires = []
+    last_fire_idx = -10**9
+    for i in range(n):
+        if candles[i]["t"][11:16] in BACKTEST_EXCLUDED_OPEN_TIMES:
+            continue
+        if i - last_fire_idx <= SETUP_COOLDOWN_BARS:
+            continue
+        fx = factors_at(i)
+        bull, bear = len(fx["bullish"]), len(fx["bearish"])
+        if bull >= min_score and bull > bear:
+            direction, reasons = "bullish", fx["bullish"]
+        elif bear >= min_score and bear > bull:
+            direction, reasons = "bearish", fx["bearish"]
+        else:
+            continue
+        last_fire_idx = i
+        entry = candles[i]["close"]
+        fire = {"t": candles[i]["t"], "direction": direction, "score": len(reasons), "reasons": reasons,
+                "entry": entry, "evaluated": False}
+        if i + SETUP_HORIZON_BARS < n:
+            fire["evaluated"] = True
+            window_bars = candles[i + 1: i + 1 + SETUP_HORIZON_BARS]
+            reach = (max(b["high"] for b in window_bars) - entry) if direction == "bullish" \
+                else (entry - min(b["low"] for b in window_bars))
+            for target in SETUP_TARGETS_PTS:
+                fire[f"hit_{int(target)}"] = reach >= target
+        fires.append(fire)
+
+    # --- Base rates: what any random bar achieves, for honest comparison ---
+    baselines = {}
+    eval_idx = [i for i in range(n - SETUP_HORIZON_BARS) if candles[i]["t"][11:16] not in BACKTEST_EXCLUDED_OPEN_TIMES]
+    for target in SETUP_TARGETS_PTS:
+        ups = downs = 0
+        for i in eval_idx:
+            entry = candles[i]["close"]
+            window_bars = candles[i + 1: i + 1 + SETUP_HORIZON_BARS]
+            if max(b["high"] for b in window_bars) - entry >= target:
+                ups += 1
+            if entry - min(b["low"] for b in window_bars) >= target:
+                downs += 1
+        baselines[f"baseline_up_{int(target)}_pct"] = round(ups / len(eval_idx) * 100, 1) if eval_idx else None
+        baselines[f"baseline_down_{int(target)}_pct"] = round(downs / len(eval_idx) * 100, 1) if eval_idx else None
+
+    evaluated = [f for f in fires if f["evaluated"]]
+    stats = {"fires_total": len(fires), "fires_evaluated": len(evaluated), **baselines}
+    for target in SETUP_TARGETS_PTS:
+        key = f"hit_{int(target)}"
+        hits = sum(1 for f in evaluated if f.get(key))
+        stats[f"hits_{int(target)}"] = hits
+        stats[f"hit_rate_{int(target)}_pct"] = round(hits / len(evaluated) * 100, 1) if evaluated else None
+
+    live = {"t": candles[-1]["t"] if candles else None, "fired": False, "direction": None, "score": 0, "reasons": []}
+    if candles:
+        fx = factors_at(n - 1)
+        bull, bear = len(fx["bullish"]), len(fx["bearish"])
+        if bull >= min_score and bull > bear:
+            live.update({"fired": True, "direction": "bullish", "score": bull, "reasons": fx["bullish"]})
+        elif bear >= min_score and bear > bull:
+            live.update({"fired": True, "direction": "bearish", "score": bear, "reasons": fx["bearish"]})
+        elif bull or bear:
+            side = "bullish" if bull >= bear else "bearish"
+            live.update({"direction": side, "score": max(bull, bear), "reasons": fx[side]})
+    return {"fires": fires, "stats": stats, "live": live}
+
+
+@app.get("/api/upstox/setup")
+async def upstox_setup():
+    """Live SMC confluence read on the Nifty 50 index (5-min bars): merges
+    the trailing week of historical candles with today's still-forming
+    session, runs detect_confluence_setups over the whole thing, and
+    returns the live setup state alongside the rule's own measured
+    trailing-week hit rate (vs base rate). Context from OI zones and the
+    top-10 movers signal is appended as extra reasons but deliberately NOT
+    counted toward the fired/not-fired score -- those factors aren't part
+    of the replayed rule, so including them would break the "the hit rate
+    you see is for the rule you're seeing" guarantee."""
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "error": "Upstox not connected — visit /api/upstox/login", "live": None, "stats": None}
+
+    nifty_key = UPSTOX_UNDERLYING_KEY["NIFTY"]
+    to_date = dt.date.today()
+    from_date = to_date - dt.timedelta(days=8)
+    encoded_key = quote(nifty_key, safe="")
+
+    async def fetch_today_intraday() -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=15) as up_client:
+                resp = await up_client.get(
+                    f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/5",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                )
+            return _parse_candles(resp.json()) if resp.status_code == 200 else []
+        except Exception:
+            return []
+
+    week_candles, today_candles = await asyncio.gather(
+        _fetch_range_candles(token, nifty_key, "minutes", 5, from_date.isoformat(), to_date.isoformat()),
+        fetch_today_intraday(),
+    )
+    seen = {c["t"] for c in week_candles}
+    candles = week_candles + [c for c in today_candles if c["t"] not in seen]
+    candles.sort(key=lambda c: c["t"])
+    if len(candles) < 30:
+        return {"connected": True, "error": "not enough Nifty candles to analyze", "live": None, "stats": None}
+
+    result = detect_confluence_setups(candles)
+
+    # Unmeasured supporting context (movers + OI zones), clearly separated.
+    context = []
+    try:
+        movers = await upstox_movers()
+        if movers.get("implied_points") is not None:
+            context.append(f"top-10 weighted implied move since open: {movers['implied_points']:+.0f} pts")
+        chain = await upstox_optionchain(symbol="NIFTY", expiry=None)
+        rows = chain.get("rows") or []
+        if rows:
+            oi_bias = compute_oi_bias(rows)
+            if oi_bias.get("support_strike") is not None:
+                context.append(f"heaviest put OI build (support zone) at {oi_bias['support_strike']:.0f}")
+            if oi_bias.get("resistance_strike") is not None:
+                context.append(f"heaviest call OI build (resistance zone) at {oi_bias['resistance_strike']:.0f}")
+    except Exception:
+        pass  # context is a nice-to-have; the measured core must still return
+
+    return {
+        "connected": True,
+        "live": result["live"], "stats": result["stats"],
+        "recent_fires": result["fires"][-10:],
+        "context": context,
+        "bars_analyzed": len(candles),
+        "from_date": from_date.isoformat(), "to_date": to_date.isoformat(),
+    }
+
+
 # ---------------- Full Nifty 50 constituent board (unweighted) ----------------
 # Best-effort snapshot of current Nifty 50 membership, symbol/ISIN pairs
 # only -- unlike NIFTY_TOP10 above, this deliberately carries no per-stock

@@ -1196,6 +1196,135 @@ function PredictivePanel() {
   );
 }
 
+/* ---------- SMC confluence setup: sweep + FVG + OB + structure ----------
+   Reads api/index.py's /api/upstox/setup. The week-long SMC backtest
+   found none of these patterns predicts direction ALONE, so the backend
+   only "fires" when >=2 candle factors align -- and, critically, it
+   replays the exact same rule over the trailing week on every call and
+   returns its real measured hit rate vs the base rate of any random bar
+   making the same move. This panel shows that earned accuracy right next
+   to the live signal, so the signal can never claim more than it has
+   actually delivered. */
+const SETUP_POLL_MS = 15000;
+
+function SetupPanel() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const fetchInFlight = useRef(false);
+
+  useEffect(() => {
+    const tick = async () => {
+      if (fetchInFlight.current) return;
+      fetchInFlight.current = true;
+      try {
+        const res = await fetch(`${PCR_API_BASE}/upstox/setup`);
+        setData(await res.json());
+      } catch {
+        // background tick -- not worth surfacing an error banner for
+      } finally {
+        setLoading(false);
+        fetchInFlight.current = false;
+      }
+    };
+    tick();
+    const id = setInterval(tick, SETUP_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  const live = data?.live;
+  const stats = data?.stats;
+  const liveColor = live?.direction === "bullish" ? T.put : live?.direction === "bearish" ? T.call : T.muted;
+
+  return (
+    <div style={{ gridColumn: "1 / -1" }}>
+      <Panel
+        title="Move setup (SMC confluence: sweeps · FVG · order blocks · structure)"
+        right={
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {stats?.hit_rate_10_pct != null && (
+              <span title={`Of the ${stats.fires_evaluated} setups this exact rule fired over the trailing week, this many reached a 10pt move within 30 minutes. Base rate for any random bar: up ${stats.baseline_up_10_pct}% / down ${stats.baseline_down_10_pct}%.`}>
+                <Chip color={T.cyan}>Measured: {fmtNum(stats.hit_rate_10_pct, 0)}% hit +10pt ({stats.fires_evaluated} fires/wk)</Chip>
+              </span>
+            )}
+            <span
+              style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: data?.connected ? T.cyan : T.amber }}
+              title={data?.connected ? "Live via your connected Upstox account" : "Upstox not connected — visit /api/upstox/login"}
+            >
+              {data?.connected ? "via Upstox" : "not connected"}
+            </span>
+          </div>
+        }
+      >
+        {loading ? (
+          <EmptyNote>Loading…</EmptyNote>
+        ) : !data?.connected ? (
+          <EmptyNote>{data?.error || "Upstox not connected — visit /api/upstox/login."}</EmptyNote>
+        ) : data?.error ? (
+          <EmptyNote>{data.error}</EmptyNote>
+        ) : (
+          <>
+            <div style={{
+              display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", marginBottom: 14,
+              padding: "12px 14px", borderRadius: 10,
+              background: live?.fired ? `${liveColor}14` : T.panel2,
+              border: `1px solid ${live?.fired ? liveColor : T.line}`,
+            }}>
+              <div style={{ fontFamily: DISP, fontSize: 15, fontWeight: 700, color: live?.fired ? liveColor : T.muted }}>
+                {live?.fired
+                  ? `${live.direction === "bullish" ? "📈" : "📉"} SETUP FIRING — ${live.direction.toUpperCase()}, watching for a 10–20pt ${live.direction === "bullish" ? "rise" : "fall"} within ~30 min`
+                  : live?.score > 0
+                    ? `No setup — ${live.score}/${2} ${live.direction} factor${live.score !== 1 ? "s" : ""} present, needs 2 aligned`
+                    : "No setup — no factors aligned on the current bar"}
+              </div>
+            </div>
+
+            {(live?.reasons || []).length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 6 }}>
+                  Why {live.fired ? "(counted factors)" : "(factors present so far)"}
+                </div>
+                {live.reasons.map((r, i) => (
+                  <div key={i} style={{ fontFamily: DISP, fontSize: 13, color: T.fg, lineHeight: 1.6 }}>▸ {r}</div>
+                ))}
+              </div>
+            )}
+
+            {(data.context || []).length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 6 }}>
+                  Supporting context (not counted in the score — unmeasured)
+                </div>
+                {data.context.map((r, i) => (
+                  <div key={i} style={{ fontFamily: DISP, fontSize: 12, color: T.muted, lineHeight: 1.6 }}>· {r}</div>
+                ))}
+              </div>
+            )}
+
+            {stats && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 12 }}>
+                <Row label="Fires (trailing week)" value={stats.fires_evaluated} />
+                <Row label="Hit +10pt in 30min" value={stats.hit_rate_10_pct != null ? `${stats.hit_rate_10_pct}%` : "—"}
+                  color={directionColor((stats.hit_rate_10_pct ?? 0) - Math.max(stats.baseline_up_10_pct ?? 0, stats.baseline_down_10_pct ?? 0))} />
+                <Row label="Base rate (any bar, 10pt)" value={stats.baseline_up_10_pct != null ? `↑${stats.baseline_up_10_pct}% / ↓${stats.baseline_down_10_pct}%` : "—"} />
+                <Row label="Hit +20pt in 30min" value={stats.hit_rate_20_pct != null ? `${stats.hit_rate_20_pct}%` : "—"} />
+                <Row label="Base rate (any bar, 20pt)" value={stats.baseline_up_20_pct != null ? `↑${stats.baseline_up_20_pct}% / ↓${stats.baseline_down_20_pct}%` : "—"} />
+              </div>
+            )}
+
+            <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, lineHeight: 1.5 }}>
+              The rule fires only when ≥2 of the four candle factors (fresh liquidity sweep, active FVG touch, first order-block
+              touch, structure bias) align in one direction. The hit rates above are the same rule replayed over the trailing
+              week's real 5-min bars — earned, not claimed. If the measured rate isn't meaningfully above the base rate, this
+              rule has no edge right now and its signals should be read accordingly. Opening candles (09:15–09:39) excluded.
+              Automated analysis for information only — not investment advice.
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 /* ---------- backtest: which stocks drive big 5-min Nifty moves ----------
    Reads api/index.py's /api/upstox/movers/backtest -- a genuinely heavy
    call (11 parallel Upstox requests pulling a month of 5-min history), so
@@ -2259,6 +2388,7 @@ export default function App() {
           <MoversPanel />
           <Nifty50Panel />
           <PredictivePanel />
+          <SetupPanel />
           <BacktestPanel />
           <div style={{ gridColumn: "1 / -1" }}>
             <PaperTradingPanel />
