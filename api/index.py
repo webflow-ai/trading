@@ -25,6 +25,7 @@ import os
 import json
 import asyncio
 import datetime as dt
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -791,6 +792,148 @@ async def upstox_stock_history(symbol: str = Query(...), interval: str = Query("
         return {"connected": False, "points": [], "error": "Upstox not connected — visit /api/upstox/login"}
 
     return {"connected": True, "points": await _fetch_stock_history(token, stock["isin"], interval)}
+
+
+# ---------------- Backtest: which stocks drive big 5-min Nifty moves ----------------
+# Ad-hoc analysis promoted to a real endpoint after a one-off script version
+# (run manually, not committed) validated the approach: pull a month of real
+# 5-min OHLC for the Nifty 50 index + NIFTY_TOP10, find bars where the index
+# moved a large amount within that single 5-min candle, and attribute each
+# one to whichever of the 10 stocks moved the most in that same window.
+BACKTEST_EXCLUDED_OPEN_TIMES = {"09:15", "09:20", "09:25", "09:30", "09:35"}
+# The opening 25 minutes (five 5-min bars) are excluded by default -- gap-
+# open/price-discovery noise right at market open produces artificially
+# large 5-min moves that aren't really "driven" by any one stock's ordinary
+# trading; live-verified this cut one month's event count from 14 to 5.
+
+
+async def _fetch_range_candles(token: str, instrument_key: str, unit: str, number: int, from_date: str, to_date: str) -> list[dict]:
+    """Same v3 historical-candle range endpoint _fetch_stock_history's daily
+    fallback uses, generalized to any unit/number/date-range -- this is
+    what makes a month of 5-min bars possible (the intraday-only endpoint
+    used elsewhere in this file is limited to the current trading day).
+    Never raises: any failure returns an empty list, same degrade-per-
+    instrument convention as the rest of this file's Upstox integrations.
+    """
+    encoded_key = quote(instrument_key, safe="")
+    try:
+        async with httpx.AsyncClient(timeout=20) as up_client:
+            resp = await up_client.get(
+                f"https://api.upstox.com/v3/historical-candle/{encoded_key}/{unit}/{number}/{to_date}/{from_date}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        if resp.status_code != 200:
+            return []
+        return _parse_candles(resp.json())
+    except Exception:
+        return []
+
+
+@app.get("/api/upstox/movers/backtest")
+async def upstox_movers_backtest(days: int = Query(30), threshold_pts: float = Query(50.0)):
+    """Backtests the same weight% x %change formula /api/upstox/movers uses
+    live, against `days` of real history: finds every 5-min Nifty 50 bar
+    where the index moved at least threshold_pts within that single bar
+    (excluding the opening candles, see BACKTEST_EXCLUDED_OPEN_TIMES), and
+    for each one, ranks NIFTY_TOP10 by how much they moved in that same
+    window. Also reports direction-match accuracy of the weighted formula
+    against the real index move across every bar in the range, not just
+    the flagged events.
+
+    This is a genuinely heavy call -- 11 parallel Upstox requests (index +
+    10 stocks), each returning ~75 bars/trading day -- so the frontend
+    should trigger it on load/manual-refresh only, never on a poll
+    interval. "Top mover" attribution is correlation within the same
+    5-minute bar, not proof of causation -- the best a bar-level backtest
+    like this can honestly claim.
+    """
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "error": "Upstox not connected — visit /api/upstox/login"}
+
+    to_date = dt.date.today()
+    from_date = to_date - dt.timedelta(days=days)
+    weight_by_symbol = {s["symbol"]: s["weight_pct"] for s in NIFTY_TOP10}
+
+    nifty_task = _fetch_range_candles(token, UPSTOX_UNDERLYING_KEY["NIFTY"], "minutes", 5, from_date.isoformat(), to_date.isoformat())
+    stock_tasks = [
+        _fetch_range_candles(token, f"NSE_EQ|{s['isin']}", "minutes", 5, from_date.isoformat(), to_date.isoformat())
+        for s in NIFTY_TOP10
+    ]
+    nifty_candles, *stock_candle_lists = await asyncio.gather(nifty_task, *stock_tasks)
+
+    if not nifty_candles:
+        return {"connected": True, "error": "no Nifty 50 index candles returned for this range", "events": []}
+
+    stock_by_symbol = {
+        s["symbol"]: {c["t"]: c for c in candles}
+        for s, candles in zip(NIFTY_TOP10, stock_candle_lists)
+    }
+
+    events = []
+    scored_bars = []  # (implied_pct, nifty_move_pct) for every non-excluded bar with data
+    excluded_count = 0
+    for bar in nifty_candles:
+        t = bar["t"]
+        if t[11:16] in BACKTEST_EXCLUDED_OPEN_TIMES:
+            excluded_count += 1
+            continue
+        o, c = bar["open"], bar["close"]
+        if not o:
+            continue
+        move_pts = c - o
+        move_pct = (c - o) / o * 100
+
+        contributions = []
+        implied_pct = 0.0
+        for sym, weight in weight_by_symbol.items():
+            srow = stock_by_symbol.get(sym, {}).get(t)
+            if not srow or not srow["open"]:
+                continue
+            spct = (srow["close"] - srow["open"]) / srow["open"] * 100
+            contributions.append({"symbol": sym, "pct_change": round(spct, 3)})
+            implied_pct += spct * weight / 100
+
+        if not contributions:
+            continue
+        scored_bars.append((implied_pct, move_pct))
+
+        if abs(move_pts) >= threshold_pts:
+            contributions.sort(key=lambda c: abs(c["pct_change"]), reverse=True)
+            events.append({
+                "t": t, "nifty_move_pts": round(move_pts, 1), "nifty_move_pct": round(move_pct, 3),
+                "implied_pct": round(implied_pct, 3), "top_movers": contributions[:3],
+            })
+
+    scored_bars = [(i, n) for i, n in scored_bars if n != 0]
+    direction_matches = sum(1 for implied, actual in scored_bars if (implied > 0) == (actual > 0))
+    direction_accuracy = round(direction_matches / len(scored_bars) * 100, 1) if scored_bars else None
+    rmse = (
+        round((sum((implied - actual) ** 2 for implied, actual in scored_bars) / len(scored_bars)) ** 0.5, 4)
+        if scored_bars else None
+    )
+
+    event_direction_matches = sum(1 for ev in events if (ev["implied_pct"] > 0) == (ev["nifty_move_pct"] > 0))
+    event_direction_accuracy = round(event_direction_matches / len(events) * 100, 1) if events else None
+
+    top_driver_counts: dict[str, int] = {}
+    for ev in events:
+        if ev["top_movers"]:
+            top_sym = ev["top_movers"][0]["symbol"]
+            top_driver_counts[top_sym] = top_driver_counts.get(top_sym, 0) + 1
+
+    return {
+        "connected": True,
+        "days": days, "threshold_pts": threshold_pts,
+        "from_date": from_date.isoformat(), "to_date": to_date.isoformat(),
+        "total_bars": len(nifty_candles), "excluded_opening_bars": excluded_count,
+        "event_count": len(events), "events": events,
+        "top_driver_counts": top_driver_counts,
+        "direction_accuracy_all_bars_pct": direction_accuracy,
+        "direction_accuracy_events_pct": event_direction_accuracy,
+        "rmse_all_bars": rmse,
+        "top10_weight_pct": sum(weight_by_symbol.values()),
+    }
 
 
 # ---------------- Full Nifty 50 constituent board (unweighted) ----------------

@@ -359,3 +359,73 @@ def test_upstox_stock_history_returns_points_for_known_symbol(monkeypatch):
     body = r.json()
     assert body["connected"] is True
     assert body["points"] == [{"t": "2026-08-14T09:15:00+05:30", "open": 1300, "high": 1305, "low": 1298, "close": 1302.5, "volume": 500}]
+
+
+# ---------------- backtest: which stocks drive big 5-min Nifty moves ----------------
+
+def test_upstox_movers_backtest_not_connected(monkeypatch):
+    _reset_upstox_state(monkeypatch)
+
+    r = client.get("/api/upstox/movers/backtest")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["connected"] is False
+    assert "not connected" in body["error"]
+
+
+def test_upstox_movers_backtest_excludes_opening_bars_and_attributes_top_driver(monkeypatch):
+    monkeypatch.setattr(index_module, "upstox_token", {"access_token": "tok123", "obtained_at": "now"})
+
+    # Nifty: one bar at the excluded 09:15 open (huge move, should NOT
+    # become an event) and one real event at 10:00 (+60 pts, above the
+    # default 50pt threshold).
+    nifty_response = FakeUpstoxResponse(200, {
+        "data": {"candles": [
+            ["2026-08-14T10:00:00+05:30", 24200.0, 24265.0, 24195.0, 24260.0, 0, 0],
+            ["2026-08-14T09:15:00+05:30", 24000.0, 24500.0, 23900.0, 24400.0, 0, 0],
+        ]},
+    })
+    # HDFCBANK moves +2% in the 10:00 bar (the biggest of the ten by far);
+    # every other stock moves a token +0.01% so HDFCBANK is unambiguously
+    # the top driver. No 09:15 row needed -- that bar is excluded before
+    # stock data is even consulted.
+    hdfc_response = FakeUpstoxResponse(200, {
+        "data": {"candles": [["2026-08-14T10:00:00+05:30", 700.0, 715.0, 699.0, 714.0, 1000, 0]]},
+    })
+    tiny_move_response = FakeUpstoxResponse(200, {
+        "data": {"candles": [["2026-08-14T10:00:00+05:30", 1000.0, 1000.2, 999.9, 1000.1, 1000, 0]]},
+    })
+
+    routes = {"NSE_INDEX": nifty_response, "INE040A01034": hdfc_response}  # HDFC Bank's ISIN
+    for s in index_module.NIFTY_TOP10:
+        if s["symbol"] != "HDFCBANK":
+            routes[s["isin"]] = tiny_move_response
+    fake_client = RoutingFakeUpstoxAsyncClient(routes)
+    monkeypatch.setattr(index_module.httpx, "AsyncClient", lambda **kw: fake_client)
+
+    r = client.get("/api/upstox/movers/backtest", params={"days": 30, "threshold_pts": 50})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["connected"] is True
+    assert body["excluded_opening_bars"] == 1
+    assert body["event_count"] == 1
+    event = body["events"][0]
+    assert event["t"] == "2026-08-14T10:00:00+05:30"
+    assert event["nifty_move_pts"] == 60.0
+    assert event["top_movers"][0]["symbol"] == "HDFCBANK"
+    assert body["top_driver_counts"] == {"HDFCBANK": 1}
+    # the 09:15 bar contributed nothing to the accuracy scoring either
+    assert body["direction_accuracy_events_pct"] == 100.0
+
+
+def test_upstox_movers_backtest_no_nifty_data_reports_error(monkeypatch):
+    monkeypatch.setattr(index_module, "upstox_token", {"access_token": "tok123", "obtained_at": "now"})
+
+    empty_response = FakeUpstoxResponse(200, {"data": {"candles": []}})
+    monkeypatch.setattr(index_module.httpx, "AsyncClient", lambda **kw: FakeUpstoxAsyncClient(empty_response))
+
+    r = client.get("/api/upstox/movers/backtest")
+    body = r.json()
+    assert body["connected"] is True
+    assert body["events"] == []
+    assert "error" in body

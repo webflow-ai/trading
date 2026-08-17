@@ -970,6 +970,157 @@ function Nifty50Panel() {
   );
 }
 
+/* ---------- backtest: which stocks drive big 5-min Nifty moves ----------
+   Reads api/index.py's /api/upstox/movers/backtest -- a genuinely heavy
+   call (11 parallel Upstox requests pulling a month of 5-min history), so
+   this fires once on mount and otherwise only on the manual "Re-run"
+   button, same convention as the main VerdictCard's deliberately-no-
+   auto-refresh design -- never on a poll interval. */
+function BacktestPanel() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [days, setDays] = useState(30);
+  const [thresholdPts, setThresholdPts] = useState(50);
+
+  const runBacktest = useCallback(async () => {
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await fetch(`${PCR_API_BASE}/upstox/movers/backtest?days=${days}&threshold_pts=${thresholdPts}`);
+      const json = await res.json();
+      if (!json.connected) {
+        setErr(json.error || "Upstox not connected");
+        setData(null);
+      } else if (json.error) {
+        setErr(json.error);
+        setData(null);
+      } else {
+        setData(json);
+      }
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [days, thresholdPts]);
+
+  useEffect(() => { runBacktest(); }, []); // eslint-disable-line -- mount-only, deliberately not re-running when days/thresholdPts change until "Re-run" is clicked
+
+  const topDriverRows = useMemo(() => {
+    if (!data?.top_driver_counts) return [];
+    return Object.entries(data.top_driver_counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([symbol, count]) => ({ symbol, count, pct: (count / data.event_count) * 100 }));
+  }, [data]);
+
+  return (
+    <div style={{ gridColumn: "1 / -1" }}>
+      <Panel
+        title="Backtest: what drives big 5-min Nifty moves"
+        right={
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <label style={{ fontFamily: DISP, fontSize: 11, color: T.muted, display: "flex", alignItems: "center", gap: 4 }}>
+              days
+              <input
+                type="number" min="5" max="90" value={days}
+                onChange={(e) => setDays(Number(e.target.value) || 30)}
+                style={{ ...formInputStyle, width: 52, padding: "3px 6px" }}
+              />
+            </label>
+            <label style={{ fontFamily: DISP, fontSize: 11, color: T.muted, display: "flex", alignItems: "center", gap: 4 }}>
+              ≥ pts
+              <input
+                type="number" min="10" max="500" value={thresholdPts}
+                onChange={(e) => setThresholdPts(Number(e.target.value) || 50)}
+                style={{ ...formInputStyle, width: 56, padding: "3px 6px" }}
+              />
+            </label>
+            <button onClick={runBacktest} disabled={loading} style={formButtonStyle(false, loading)}>
+              {loading ? "Running…" : "Re-run"}
+            </button>
+          </div>
+        }
+      >
+        {loading && !data ? (
+          <EmptyNote>Running backtest — pulling a month of 5-min data for 11 instruments, can take several seconds…</EmptyNote>
+        ) : err ? (
+          <EmptyNote>{err}</EmptyNote>
+        ) : !data ? (
+          <EmptyNote>No backtest run yet.</EmptyNote>
+        ) : (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
+              <Row label="Events found" value={data.event_count} />
+              <Row label="Bars analyzed" value={`${data.total_bars} (${data.excluded_opening_bars} excl. open)`} />
+              <Row label="Direction accuracy (all bars)" value={data.direction_accuracy_all_bars_pct != null ? `${data.direction_accuracy_all_bars_pct}%` : "—"}
+                color={directionColor((data.direction_accuracy_all_bars_pct ?? 0) - 50)} />
+              <Row label="Direction accuracy (events)" value={data.direction_accuracy_events_pct != null ? `${data.direction_accuracy_events_pct}%` : "—"}
+                color={directionColor((data.direction_accuracy_events_pct ?? 0) - 50)} />
+              <Row label="RMSE (implied vs actual %)" value={data.rmse_all_bars != null ? fmtNum(data.rmse_all_bars, 4) : "—"} />
+            </div>
+
+            {topDriverRows.length > 0 && (
+              <>
+                <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>
+                  Top driver, by event count
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+                  {topDriverRows.map((r) => (
+                    <Chip key={r.symbol} color={T.cyan}>{r.symbol} — {r.count} ({fmtNum(r.pct, 0)}%)</Chip>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>
+              Events ({data.from_date} to {data.to_date})
+            </div>
+            {(data.events || []).length === 0 ? (
+              <EmptyNote>No events at this threshold over this window.</EmptyNote>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ color: T.muted, textAlign: "left" }}>
+                      <th style={tradeThStyle}>Time</th>
+                      <th style={tradeThStyle}>Nifty move</th>
+                      <th style={tradeThStyle}>Implied</th>
+                      <th style={tradeThStyle}>Top movers (that bar)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.events.map((ev) => (
+                      <tr key={ev.t} style={{ borderTop: `1px solid ${T.line}` }}>
+                        <td style={tradeTdStyle}>
+                          {new Date(ev.t).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
+                        </td>
+                        <td style={{ ...tradeTdStyle, color: directionColor(ev.nifty_move_pts) }}>
+                          {fmtSigned(ev.nifty_move_pts, 1)} pts ({fmtSigned(ev.nifty_move_pct, 2)}%)
+                        </td>
+                        <td style={{ ...tradeTdStyle, color: directionColor(ev.implied_pct) }}>{fmtSigned(ev.implied_pct, 3)}%</td>
+                        <td style={tradeTdStyle}>
+                          {ev.top_movers.map((m) => `${m.symbol} ${fmtSigned(m.pct_change, 2)}%`).join(", ")}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div style={{ marginTop: 12, fontFamily: DISP, fontSize: 11, color: T.muted }}>
+              "Top driver" is whichever of NIFTY_TOP10 moved the most in that same 5-minute bar — correlation within the window,
+              not proof of causation. Opening candles (09:15–09:39 IST) are excluded from every event and accuracy figure above.
+              Automated analysis for information only — not investment advice.
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 /* ---------- paper trading journal ----------
    Simulated options trades: opened with an entry premium (typed in, or
    pulled from the live option chain below), closed later with an exit
@@ -1881,6 +2032,7 @@ export default function App() {
           <LevelsPanel brief={brief} />
           <MoversPanel />
           <Nifty50Panel />
+          <BacktestPanel />
           <div style={{ gridColumn: "1 / -1" }}>
             <PaperTradingPanel />
           </div>
