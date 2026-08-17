@@ -567,6 +567,30 @@ def _movers_verdict(implied_move_pct: float | None) -> str | None:
     return "Flat open"
 
 
+def _prev_close_from_quote(q: dict) -> float | None:
+    """Upstox's market-quote/quotes `ohlc.close` is documented as *today's*
+    running close, which trivially equals last_price for as long as the
+    market is open (it only becomes a fixed prior-session figure after
+    that session ends) -- confirmed live 2026-08-17 09:39 IST, ohlc.close
+    == last_price for every NIFTY_TOP10 stock while trading was live,
+    which made every %change compute to exactly 0 during market hours (the
+    bug hid over a weekend, when ohlc.close legitimately was Friday's
+    final, fixed close).
+
+    Upstox separately provides `net_change` (last_price minus the *real*
+    previous close) directly in the same quote object, with no such
+    live-session ambiguity, so prev_close is derived from that instead:
+    last_price - net_change. Falls back to ohlc.close only if net_change
+    is missing -- correct in exactly the case this bug didn't show up in
+    (market closed), same graceful-degradation convention as the rest of
+    this file's Upstox integrations."""
+    ltp = q.get("last_price")
+    net_change = q.get("net_change")
+    if ltp is not None and net_change is not None:
+        return ltp - net_change
+    return (q.get("ohlc") or {}).get("close")
+
+
 @app.get("/api/upstox/movers")
 async def upstox_movers():
     """Live top-10-by-weight Nifty constituents, each stock's %change since
@@ -643,7 +667,7 @@ async def upstox_movers():
     for s in NIFTY_TOP10:
         q = by_key.get(f"NSE_EQ|{s['isin']}")
         ltp = q.get("last_price") if q else None
-        prev_close = (q.get("ohlc") or {}).get("close") if q else None
+        prev_close = _prev_close_from_quote(q) if q else None
         pct_change = (ltp - prev_close) / prev_close * 100 if ltp is not None and prev_close else None
         contribution = (pct_change * s["weight_pct"] / 100) if pct_change is not None else None
         if contribution is not None:
@@ -1078,7 +1102,7 @@ async def upstox_nifty50():
     for s in NIFTY50_ALL:
         q = by_key.get(f"NSE_EQ|{s['isin']}")
         ltp = q.get("last_price") if q else None
-        prev_close = (q.get("ohlc") or {}).get("close") if q else None
+        prev_close = _prev_close_from_quote(q) if q else None
         pct_change = (ltp - prev_close) / prev_close * 100 if ltp is not None and prev_close else None
         if pct_change is not None:
             if pct_change > 0:

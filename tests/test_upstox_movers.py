@@ -120,6 +120,43 @@ def test_upstox_movers_computes_weighted_contribution_when_connected(monkeypatch
     assert fake_client.calls[0][1]["headers"]["Authorization"] == "Bearer tok123"
 
 
+def test_upstox_movers_uses_net_change_not_ohlc_close_during_live_market(monkeypatch):
+    """Regression test for a real bug caught live 2026-08-17: during market
+    hours, Upstox's ohlc.close mirrors last_price (it's today's *running*
+    close, not the prior session's fixed one), which made every stock's
+    pct_change compute to exactly 0 while the market was open. Confirmed
+    live against a real quote (HDFCBANK: last_price=725.8, ohlc.close=725.8,
+    net_change=-1.2 -> real prev_close=727.0) -- this fixture matches that
+    shape exactly."""
+    monkeypatch.setattr(index_module, "upstox_token", {"access_token": "tok123", "obtained_at": "now"})
+
+    hdfc = index_module.NIFTY_TOP10[0]
+    fake_response = FakeUpstoxResponse(200, {
+        "data": {
+            "NSE_EQ:HDFCBANK": {
+                "instrument_token": f"NSE_EQ|{hdfc['isin']}",
+                "last_price": 725.8,
+                "ohlc": {"close": 725.8},  # deceptively equals last_price -- the bug
+                "net_change": -1.2,
+            },
+        },
+    })
+    monkeypatch.setattr(index_module.httpx, "AsyncClient", lambda **kw: FakeUpstoxAsyncClient(fake_response))
+
+    r = client.get("/api/upstox/movers")
+    body = r.json()
+    hdfc_row = next(s for s in body["stocks"] if s["symbol"] == "HDFCBANK")
+    assert hdfc_row["prev_close"] == 727.0  # 725.8 - (-1.2), not the misleading ohlc.close
+    assert round(hdfc_row["pct_change"], 4) == round(-1.2 / 727.0 * 100, 4)
+    assert hdfc_row["pct_change"] != 0  # the actual bug: this used to always read 0 live
+
+
+def test_prev_close_from_quote_falls_back_to_ohlc_close_without_net_change():
+    # Market-closed case (e.g. weekend) -- no net_change field, ohlc.close
+    # is then the real, fixed prior-session close and is safe to use.
+    assert index_module._prev_close_from_quote({"last_price": 100.0, "ohlc": {"close": 98.5}}) == 98.5
+
+
 def test_upstox_movers_401_clears_token_and_reports_not_connected(monkeypatch):
     monkeypatch.setattr(index_module, "upstox_token", {"access_token": "stale-token", "obtained_at": "now"})
 
