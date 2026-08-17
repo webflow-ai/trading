@@ -416,6 +416,12 @@ function ParticipantPanel({ brief }) {
 const MOVERS_POLL_MS = 5000;
 const MOVERS_SNAPSHOT_THROTTLE_MS = 5 * 60 * 1000;
 const MOVERS_HISTORY_POLL_MS = 60000;
+// Shared between the sparkline tiles' background poll and the modal's
+// interval picker default -- keeping this in one place means the modal's
+// "already have this one, no fetch needed" shortcut can't drift out of
+// sync with whatever interval the panel is actually polling at (it did,
+// briefly: both were hardcoded to "30minute" separately until this).
+const MOVERS_HISTORY_DEFAULT_INTERVAL = "5minute";
 const MOVE_ALERT_DEFAULT_THRESHOLD_PTS = 30;
 
 // Non-blocking toast (not a modal -- it shouldn't interrupt whatever the
@@ -590,8 +596,9 @@ function LightweightChart({ symbol, points, chartType }) {
 
 // Expanded single-stock chart, opened by clicking a tile or table row in
 // MoversPanel below. Starts from whatever history/quote data the panel
-// already has in state (same 30-minute series backing the small sparkline,
-// passed in as `points`) so the chart is visible instantly with no fetch
+// already has in state (same MOVERS_HISTORY_DEFAULT_INTERVAL series
+// backing the small sparkline, passed in as `points`) so the chart is
+// visible instantly with no fetch
 // on open. Switching the interval picker below re-fetches just this one
 // stock at the new granularity via /api/upstox/stock/history -- lighter
 // than the panel's own batch endpoint, which always pulls all 10. Area vs.
@@ -609,14 +616,14 @@ function LightweightChart({ symbol, points, chartType }) {
 // Upstox data.
 function StockDetailModal({ symbol, name, ltp, pctChange, points, onClose }) {
   const [chartType, setChartType] = useState("area");
-  const [interval, setIntervalValue] = useState("30minute");
+  const [interval, setIntervalValue] = useState(MOVERS_HISTORY_DEFAULT_INTERVAL);
   const [ownPoints, setOwnPoints] = useState(points);
   const [loadingPoints, setLoadingPoints] = useState(false);
   const color = directionColor(pctChange);
 
   const selectInterval = useCallback(async (value) => {
     setIntervalValue(value);
-    if (value === "30minute") {
+    if (value === MOVERS_HISTORY_DEFAULT_INTERVAL) {
       setOwnPoints(points); // already have this one from the panel -- no fetch needed
       return;
     }
@@ -782,7 +789,7 @@ function MoversPanel() {
       if (historyFetchInFlight.current) return;
       historyFetchInFlight.current = true;
       try {
-        const res = await fetch(`${PCR_API_BASE}/upstox/movers/history?interval=30minute`);
+        const res = await fetch(`${PCR_API_BASE}/upstox/movers/history?interval=${MOVERS_HISTORY_DEFAULT_INTERVAL}`);
         setHistory(await res.json());
       } catch {
         // background tick -- charts just stay empty for this cycle
