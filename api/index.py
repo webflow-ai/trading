@@ -1389,6 +1389,255 @@ async def upstox_setup():
     }
 
 
+# ---------------- 1-minute breakout zones ----------------
+# Faster-refreshing companion to the 5-min confluence detector above:
+# tracks the range Nifty has been coiling in on 1-min bars, reports the
+# levels a break would have to clear, and -- same honesty mechanism as
+# /api/upstox/setup -- replays the identical rule over several days of
+# real 1-min bars to report how often a break actually followed through,
+# against the base rate of any random bar doing the same.
+#
+# Strike mapping in the endpoint is deliberately FACTUAL ONLY (which
+# listed strikes sit nearest spot and nearest each breakout level, with
+# their live OI/LTP). It does not recommend a position -- that's the
+# user's call, not this endpoint's.
+BREAKOUT_LOOKBACK_BARS = 30      # the range being coiled in: prior 30 one-min bars
+BREAKOUT_HORIZON_BARS = 15       # follow-through measured over the next 15 min
+BREAKOUT_TARGETS_PTS = (10.0, 20.0)
+BREAKOUT_COOLDOWN_BARS = 10      # one break per move, not one per bar while extended
+NIFTY_STRIKE_STEP = 50           # NSE lists NIFTY strikes in 50-pt increments
+OPENING_WINDOW_END_HHMM = "09:40"  # bars before this are opening price-discovery noise
+
+
+def _is_opening_window(t: str) -> bool:
+    """True for candles inside the opening price-discovery window
+    (09:15-09:39 IST). Works at any bar size, unlike the fixed 5-min
+    BACKTEST_EXCLUDED_OPEN_TIMES set used by the older 5-min analyses."""
+    return t[11:16] < OPENING_WINDOW_END_HHMM
+
+
+def detect_breakouts(
+    candles: list[dict],
+    lookback: int = BREAKOUT_LOOKBACK_BARS,
+    horizon: int = BREAKOUT_HORIZON_BARS,
+    targets: tuple[float, ...] = BREAKOUT_TARGETS_PTS,
+) -> dict:
+    """Range-break detector over 1-min bars, plus its own measured
+    follow-through rate. Pure function (no network) so it's directly
+    testable.
+
+    A bar "breaks out" when its close clears the high (or low) of the
+    `lookback` bars immediately before it. Each break is then evaluated
+    over the following `horizon` bars: did price extend a further N
+    points in the break's direction (measured from the breaking close)?
+    Base rates -- how often ANY admissible bar saw the same extension --
+    are computed alongside, because a break that "works" 60% of the time
+    in a market where any random bar works 60% of the time is not a
+    signal at all.
+    """
+    n = len(candles)
+    fires: list[dict] = []
+    last_fire_idx = -10**9
+
+    for i in range(lookback, n):
+        if _is_opening_window(candles[i]["t"]):
+            continue
+        if i - last_fire_idx <= BREAKOUT_COOLDOWN_BARS:
+            continue
+        window = candles[i - lookback:i]
+        prior_high = max(b["high"] for b in window)
+        prior_low = min(b["low"] for b in window)
+        close = candles[i]["close"]
+
+        if close > prior_high:
+            direction, level = "up", prior_high
+        elif close < prior_low:
+            direction, level = "down", prior_low
+        else:
+            continue
+
+        last_fire_idx = i
+        fire = {
+            "t": candles[i]["t"], "direction": direction,
+            "level": round(level, 2), "entry": close,
+            "range_width_pts": round(prior_high - prior_low, 2),
+            "evaluated": False,
+        }
+        if i + horizon < n:
+            fire["evaluated"] = True
+            fwd = candles[i + 1: i + 1 + horizon]
+            extension = (max(b["high"] for b in fwd) - close) if direction == "up" \
+                else (close - min(b["low"] for b in fwd))
+            fire["extension_pts"] = round(extension, 2)
+            for target in targets:
+                fire[f"hit_{int(target)}"] = extension >= target
+        fires.append(fire)
+
+    # Base rate: same horizon, same targets, every admissible bar.
+    eligible = [i for i in range(n - horizon) if not _is_opening_window(candles[i]["t"])]
+    stats: dict = {"fires_total": len(fires)}
+    for target in targets:
+        up = down = 0
+        for i in eligible:
+            close = candles[i]["close"]
+            fwd = candles[i + 1: i + 1 + horizon]
+            if max(b["high"] for b in fwd) - close >= target:
+                up += 1
+            if close - min(b["low"] for b in fwd) >= target:
+                down += 1
+        stats[f"baseline_up_{int(target)}_pct"] = round(up / len(eligible) * 100, 1) if eligible else None
+        stats[f"baseline_down_{int(target)}_pct"] = round(down / len(eligible) * 100, 1) if eligible else None
+
+    evaluated = [f for f in fires if f["evaluated"]]
+    stats["fires_evaluated"] = len(evaluated)
+    for target in targets:
+        key = f"hit_{int(target)}"
+        hits = sum(1 for f in evaluated if f.get(key))
+        stats[f"hits_{int(target)}"] = hits
+        stats[f"hit_rate_{int(target)}_pct"] = round(hits / len(evaluated) * 100, 1) if evaluated else None
+    if evaluated:
+        stats["avg_extension_pts"] = round(sum(f["extension_pts"] for f in evaluated) / len(evaluated), 1)
+
+    # Live state: the range as of the most recent bar.
+    live: dict = {"status": "unknown", "range_high": None, "range_low": None}
+    if n > lookback:
+        window = candles[n - lookback:n]
+        range_high = max(b["high"] for b in window)
+        range_low = min(b["low"] for b in window)
+        last_close = candles[-1]["close"]
+        prior_window = candles[n - 1 - lookback:n - 1]
+        prior_high = max(b["high"] for b in prior_window)
+        prior_low = min(b["low"] for b in prior_window)
+        if last_close > prior_high:
+            status = "broke_out_up"
+        elif last_close < prior_low:
+            status = "broke_out_down"
+        else:
+            status = "consolidating"
+        live = {
+            "t": candles[-1]["t"], "status": status, "last_close": last_close,
+            "range_high": round(range_high, 2), "range_low": round(range_low, 2),
+            "range_width_pts": round(range_high - range_low, 2),
+            "pts_to_upside_break": round(range_high - last_close, 2),
+            "pts_to_downside_break": round(last_close - range_low, 2),
+            "lookback_bars": lookback,
+        }
+    return {"fires": fires, "stats": stats, "live": live}
+
+
+@app.get("/api/upstox/breakout")
+async def upstox_breakout(lookback: int = Query(BREAKOUT_LOOKBACK_BARS)):
+    """Live 1-min breakout zones on Nifty 50, the rule's own measured
+    follow-through rate over several days of real 1-min bars, and a
+    factual map of which listed strikes sit at spot and at each breakout
+    level (with live OI/LTP).
+
+    The strike section reports what exists at those prices -- it is not a
+    position recommendation. Calls gain value when the underlying rises
+    and puts when it falls; which (if either) to act on is the reader's
+    decision, not this endpoint's.
+    """
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "error": "Upstox not connected — visit /api/upstox/login", "live": None, "stats": None}
+
+    nifty_key = UPSTOX_UNDERLYING_KEY["NIFTY"]
+    to_date = dt.date.today()
+    from_date = to_date - dt.timedelta(days=5)
+    encoded_key = quote(nifty_key, safe="")
+
+    async def fetch_today_1m() -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=15) as up_client:
+                resp = await up_client.get(
+                    f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/1",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                )
+            return _parse_candles(resp.json()) if resp.status_code == 200 else []
+        except Exception:
+            return []
+
+    hist, today = await asyncio.gather(
+        _fetch_range_candles(token, nifty_key, "minutes", 1, from_date.isoformat(), to_date.isoformat()),
+        fetch_today_1m(),
+    )
+    seen = {c["t"] for c in hist}
+    candles = hist + [c for c in today if c["t"] not in seen]
+    candles.sort(key=lambda c: c["t"])
+    if len(candles) <= lookback:
+        return {"connected": True, "error": "not enough 1-min candles yet", "live": None, "stats": None}
+
+    result = detect_breakouts(candles, lookback=lookback)
+    live = result["live"]
+
+    # --- Factual strike map at spot and at each breakout level ---
+    strikes: dict = {}
+    oi_levels: dict = {}
+    try:
+        chain = await upstox_optionchain(symbol="NIFTY", expiry=None)
+        rows = chain.get("rows") or []
+        spot = chain.get("spot") or live.get("last_close")
+        if rows and spot:
+            oi_levels = compute_oi_bias(rows)
+
+            def nearest_row(price: float) -> dict | None:
+                usable = [r for r in rows if r.get("strike") is not None]
+                return min(usable, key=lambda r: abs(r["strike"] - price)) if usable else None
+
+            def describe(price: float | None) -> dict | None:
+                if price is None:
+                    return None
+                row = nearest_row(price)
+                if not row:
+                    return None
+                return {
+                    "strike": row["strike"],
+                    "ce_ltp": row.get("ceLtp"), "ce_oi": row.get("ceOi"),
+                    "pe_ltp": row.get("peLtp"), "pe_oi": row.get("peOi"),
+                }
+
+            strikes = {
+                "atm": describe(round(spot / NIFTY_STRIKE_STEP) * NIFTY_STRIKE_STEP),
+                "at_upside_break": describe(live.get("range_high")),
+                "at_downside_break": describe(live.get("range_low")),
+                "spot": spot,
+            }
+    except Exception:
+        pass  # strike context is supplementary; the measured core must still return
+
+    notes = []
+    if live.get("status") == "consolidating":
+        notes.append(
+            f"Coiling in a {live['range_width_pts']:.0f}pt range ({live['range_low']:.0f}–{live['range_high']:.0f}) "
+            f"over the last {live['lookback_bars']} minutes. Upside break needs +{live['pts_to_upside_break']:.0f} pts, "
+            f"downside break needs -{live['pts_to_downside_break']:.0f} pts."
+        )
+    elif live.get("status") in ("broke_out_up", "broke_out_down"):
+        d = "above" if live["status"] == "broke_out_up" else "below"
+        notes.append(
+            f"Price just broke {d} the prior {live['lookback_bars']}-minute range "
+            f"({live['range_low']:.0f}–{live['range_high']:.0f}). Historically this rule's breaks extended a further "
+            f"{result['stats'].get('avg_extension_pts', 0):.0f} pts on average within {BREAKOUT_HORIZON_BARS} minutes."
+        )
+    if oi_levels.get("resistance_strike") is not None:
+        notes.append(f"Heaviest call OI build (resistance zone) at {oi_levels['resistance_strike']:.0f}.")
+    if oi_levels.get("support_strike") is not None:
+        notes.append(f"Heaviest put OI build (support zone) at {oi_levels['support_strike']:.0f}.")
+    notes.append(
+        "Strike figures are factual chain data, not a recommendation — a break upward benefits calls and a break "
+        "downward benefits puts, but whether to act is your decision."
+    )
+
+    return {
+        "connected": True,
+        "live": live, "stats": result["stats"],
+        "recent_fires": result["fires"][-8:],
+        "strikes": strikes, "oi_levels": oi_levels, "notes": notes,
+        "bars_analyzed": len(candles),
+        "from_date": from_date.isoformat(), "to_date": to_date.isoformat(),
+    }
+
+
 # ---------------- Full Nifty 50 constituent board (unweighted) ----------------
 # Best-effort snapshot of current Nifty 50 membership, symbol/ISIN pairs
 # only -- unlike NIFTY_TOP10 above, this deliberately carries no per-stock

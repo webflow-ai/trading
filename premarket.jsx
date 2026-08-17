@@ -1196,6 +1196,165 @@ function PredictivePanel() {
   );
 }
 
+/* ---------- 1-minute breakout zones ----------
+   Reads api/index.py's /api/upstox/breakout: the range Nifty is coiling
+   in on 1-min bars, the levels a break has to clear, and -- same honesty
+   mechanism as SetupPanel -- the identical rule's measured follow-through
+   rate over several days of real bars against the base rate.
+
+   The strike block is FACTUAL chain data at those price levels, not a
+   position recommendation. */
+const BREAKOUT_POLL_MS = 15000;
+
+function StrikeRow({ label, data }) {
+  if (!data) return null;
+  return (
+    <tr style={{ borderTop: `1px solid ${T.line}` }}>
+      <td style={{ ...tradeTdStyle, color: T.muted }}>{label}</td>
+      <td style={tradeTdStyle}>{fmtNum(data.strike, 0)}</td>
+      <td style={{ ...tradeTdStyle, color: T.put }}>{data.ce_ltp != null ? fmtNum(data.ce_ltp, 2) : "—"}</td>
+      <td style={{ ...tradeTdStyle, color: T.call }}>{data.pe_ltp != null ? fmtNum(data.pe_ltp, 2) : "—"}</td>
+    </tr>
+  );
+}
+
+function BreakoutPanel() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const fetchInFlight = useRef(false);
+
+  useEffect(() => {
+    const tick = async () => {
+      if (fetchInFlight.current) return;
+      fetchInFlight.current = true;
+      try {
+        const res = await fetch(`${PCR_API_BASE}/upstox/breakout`);
+        setData(await res.json());
+      } catch {
+        // background tick -- not worth surfacing an error banner for
+      } finally {
+        setLoading(false);
+        fetchInFlight.current = false;
+      }
+    };
+    tick();
+    const id = setInterval(tick, BREAKOUT_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  const live = data?.live;
+  const stats = data?.stats;
+  const brokeUp = live?.status === "broke_out_up";
+  const brokeDown = live?.status === "broke_out_down";
+  const statusColor = brokeUp ? T.put : brokeDown ? T.call : T.amber;
+
+  return (
+    <div style={{ gridColumn: "1 / -1" }}>
+      <Panel
+        title="Breakout zone (1-min)"
+        right={
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {stats?.hit_rate_10_pct != null && (
+              <span title={`Of the ${stats.fires_evaluated} range-breaks this rule fired over the last few days, this many extended a further 10pts within 15 minutes. Base rate for any random bar: up ${stats.baseline_up_10_pct}% / down ${stats.baseline_down_10_pct}%.`}>
+                <Chip color={T.cyan}>Measured: {fmtNum(stats.hit_rate_10_pct, 0)}% extend +10pt ({stats.fires_evaluated} breaks)</Chip>
+              </span>
+            )}
+            <span
+              style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: data?.connected ? T.cyan : T.amber }}
+              title={data?.connected ? "Live via your connected Upstox account" : "Upstox not connected — visit /api/upstox/login"}
+            >
+              {data?.connected ? "via Upstox" : "not connected"}
+            </span>
+          </div>
+        }
+      >
+        {loading ? (
+          <EmptyNote>Loading…</EmptyNote>
+        ) : !data?.connected ? (
+          <EmptyNote>{data?.error || "Upstox not connected — visit /api/upstox/login."}</EmptyNote>
+        ) : data?.error ? (
+          <EmptyNote>{data.error}</EmptyNote>
+        ) : (
+          <>
+            <div style={{
+              display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", marginBottom: 14,
+              padding: "12px 14px", borderRadius: 10,
+              background: `${statusColor}14`, border: `1px solid ${statusColor}`,
+            }}>
+              <div style={{ fontFamily: DISP, fontSize: 15, fontWeight: 700, color: statusColor }}>
+                {brokeUp ? "📈 BROKE ABOVE the 1-min range"
+                  : brokeDown ? "📉 BROKE BELOW the 1-min range"
+                  : `⏳ Consolidating in a ${fmtNum(live?.range_width_pts, 0)}pt range`}
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 16 }}>
+              <Row label="Spot / last close" value={live?.last_close != null ? fmtNum(live.last_close, 2) : "—"} />
+              <Row label="Upside break above" value={live?.range_high != null ? fmtNum(live.range_high, 0) : "—"} color={T.put} />
+              <Row label="…needs" value={live?.pts_to_upside_break != null ? `+${fmtNum(live.pts_to_upside_break, 0)} pts` : "—"} />
+              <Row label="Downside break below" value={live?.range_low != null ? fmtNum(live.range_low, 0) : "—"} color={T.call} />
+              <Row label="…needs" value={live?.pts_to_downside_break != null ? `-${fmtNum(live.pts_to_downside_break, 0)} pts` : "—"} />
+            </div>
+
+            {(data.notes || []).length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                {data.notes.map((n, i) => (
+                  <div key={i} style={{ fontFamily: DISP, fontSize: 13, color: i === 0 ? T.fg : T.muted, lineHeight: 1.6 }}>
+                    {i === 0 ? "▸ " : "· "}{n}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {data.strikes?.atm && (
+              <>
+                <div style={{ fontFamily: DISP, fontSize: 12, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 6 }}>
+                  Strikes at these levels (live chain data — not a recommendation)
+                </div>
+                <div style={{ overflowX: "auto", marginBottom: 14 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ color: T.muted, textAlign: "left" }}>
+                        <th style={tradeThStyle}>Level</th>
+                        <th style={tradeThStyle}>Strike</th>
+                        <th style={tradeThStyle}>CE LTP</th>
+                        <th style={tradeThStyle}>PE LTP</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <StrikeRow label="At spot (ATM)" data={data.strikes.atm} />
+                      <StrikeRow label="At upside break" data={data.strikes.at_upside_break} />
+                      <StrikeRow label="At downside break" data={data.strikes.at_downside_break} />
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            {stats && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 12 }}>
+                <Row label="Breaks measured" value={stats.fires_evaluated} />
+                <Row label="Extended +10pt / 15min" value={stats.hit_rate_10_pct != null ? `${stats.hit_rate_10_pct}%` : "—"}
+                  color={directionColor((stats.hit_rate_10_pct ?? 0) - Math.max(stats.baseline_up_10_pct ?? 0, stats.baseline_down_10_pct ?? 0))} />
+                <Row label="Base rate (any bar)" value={stats.baseline_up_10_pct != null ? `↑${stats.baseline_up_10_pct}% / ↓${stats.baseline_down_10_pct}%` : "—"} />
+                <Row label="Extended +20pt / 15min" value={stats.hit_rate_20_pct != null ? `${stats.hit_rate_20_pct}%` : "—"} />
+                <Row label="Avg extension" value={stats.avg_extension_pts != null ? `${fmtNum(stats.avg_extension_pts, 1)} pts` : "—"} />
+              </div>
+            )}
+
+            <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, lineHeight: 1.5 }}>
+              A "break" is a 1-min close beyond the prior {live?.lookback_bars || 30}-minute range. Hit rates are the same rule
+              replayed over the last few days of real 1-min bars — earned, not claimed. Compare them to the base rate beside
+              them: if they're not meaningfully higher, a break here is no more informative than any random minute.
+              Opening candles (09:15–09:39) excluded. Automated analysis for information only — not investment advice.
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 /* ---------- SMC confluence setup: sweep + FVG + OB + structure ----------
    Reads api/index.py's /api/upstox/setup. The week-long SMC backtest
    found none of these patterns predicts direction ALONE, so the backend
@@ -2388,6 +2547,7 @@ export default function App() {
           <MoversPanel />
           <Nifty50Panel />
           <PredictivePanel />
+          <BreakoutPanel />
           <SetupPanel />
           <BacktestPanel />
           <div style={{ gridColumn: "1 / -1" }}>
