@@ -975,6 +975,136 @@ async def upstox_movers_backtest(days: int = Query(30), threshold_pts: float = Q
     }
 
 
+# ---------------- Predictive line: max pain + OI change + movers signal ----------------
+def compute_max_pain(rows: list[dict]) -> float | None:
+    """Max pain: the strike where option writers collectively owe the
+    least total payout if the underlying settled there at expiry.
+    Classic options-market theory holds price has some tendency to drift
+    toward it as expiry approaches -- a heuristic pattern many traders
+    watch, not a guarantee, and not backtested in this codebase the way
+    the movers implied-move signal is (see /api/upstox/movers/backtest).
+
+    pain(S) = sum over every listed strike K of
+      max(0, S-K) * call_OI(K) + max(0, K-S) * put_OI(K)
+    (the combined intrinsic value call and put holders would collect if
+    the underlying settled at S, weighted by open interest at each
+    strike -- writers' loss is buyers' gain, so this is equivalently
+    "total payout to option buyers"). max_pain is whichever listed
+    strike minimizes that. Returns None if there's no strike with usable
+    OI data.
+    """
+    candidates = [r["strike"] for r in rows if r.get("strike") is not None and (r.get("ceOi") or r.get("peOi"))]
+    if not candidates:
+        return None
+
+    def pain_at(s: float) -> float:
+        total = 0.0
+        for r in rows:
+            k = r.get("strike")
+            if k is None:
+                continue
+            total += max(0, s - k) * (r.get("ceOi") or 0) + max(0, k - s) * (r.get("peOi") or 0)
+        return total
+
+    return min(candidates, key=pain_at)
+
+
+def compute_oi_bias(rows: list[dict]) -> dict:
+    """Aggregate OI-change read across the chain: net call vs. net put OI
+    change, plus the single strike where each side is building fastest --
+    a common proxy for "resistance forming" (heavy call OI buildup) and
+    "support forming" (heavy put OI buildup). Raw OI change can't
+    distinguish fresh buying from fresh writing, so this is a rough zone
+    to watch, not a wall confirmed to hold -- same caveat as max pain
+    above, presented as context rather than an independently-weighted
+    vote in the predictive line below.
+    """
+    ce_changes = [r["ceOiChg"] for r in rows if r.get("ceOiChg") is not None]
+    pe_changes = [r["peOiChg"] for r in rows if r.get("peOiChg") is not None]
+    resistance_row = max(
+        (r for r in rows if r.get("ceOiChg") is not None), key=lambda r: r["ceOiChg"], default=None,
+    )
+    support_row = max(
+        (r for r in rows if r.get("peOiChg") is not None), key=lambda r: r["peOiChg"], default=None,
+    )
+    return {
+        "net_call_oi_change": sum(ce_changes) if ce_changes else None,
+        "net_put_oi_change": sum(pe_changes) if pe_changes else None,
+        "resistance_strike": resistance_row["strike"] if resistance_row else None,
+        "resistance_strike_oi_change": resistance_row["ceOiChg"] if resistance_row else None,
+        "support_strike": support_row["strike"] if support_row else None,
+        "support_strike_oi_change": support_row["peOiChg"] if support_row else None,
+    }
+
+
+@app.get("/api/upstox/predictive")
+async def upstox_predictive():
+    """Synthesizes a plain-English "what's coming" read from three
+    signals: the top-10 weighted implied move (/api/upstox/movers -- the
+    only one of the three with any backtested accuracy behind it, see
+    /api/upstox/movers/backtest), max pain, and OI-change bias (both
+    derived from the live NIFTY option chain, /api/upstox/optionchain).
+
+    Deliberately NOT a combined score: max pain and OI-change bias are
+    classic, widely-watched heuristics but aren't backtested here, so
+    they're presented as supporting context underneath the movers signal
+    (predictive_lines[0]) rather than additional votes averaged into one
+    number the movers signal's real ~85% backtested accuracy would then
+    misleadingly vouch for.
+    """
+    movers = await upstox_movers()
+    chain = await upstox_optionchain(symbol="NIFTY", expiry=None)
+
+    if not movers.get("connected") and not chain.get("connected"):
+        return {"connected": False, "error": movers.get("error") or chain.get("error"), "predictive_lines": []}
+
+    rows = chain.get("rows") or []
+    spot = chain.get("spot")
+    max_pain = compute_max_pain(rows) if rows else None
+    oi_bias = compute_oi_bias(rows) if rows else {}
+
+    lines = []
+    implied_points = movers.get("implied_points")
+    verdict = movers.get("verdict")
+    if implied_points is not None:
+        lines.append(
+            f"Primary signal: top-10 weighted move implies {implied_points:+.0f} pts"
+            f"{f' ({verdict})' if verdict else ''} — backtested ~85% directionally accurate over the last month "
+            f"(see the backtest panel), the only figure here with real accuracy behind it."
+        )
+    else:
+        lines.append("Primary signal unavailable — Upstox movers data didn't come through.")
+
+    if max_pain is not None and spot is not None:
+        distance = spot - max_pain
+        if abs(distance) >= 1:
+            pull_dir = "downward" if distance > 0 else "upward"
+            lines.append(
+                f"Max pain is {max_pain:.0f} vs. spot {spot:.0f} ({distance:+.0f} pts) — classic theory suggests a mild "
+                f"{pull_dir} pull toward it into expiry, a tendency rather than a rule."
+            )
+        else:
+            lines.append(f"Spot ({spot:.0f}) is already close to max pain ({max_pain:.0f}) — little pull expected from this alone.")
+
+    if oi_bias.get("resistance_strike") is not None or oi_bias.get("support_strike") is not None:
+        parts = []
+        if oi_bias.get("resistance_strike") is not None:
+            parts.append(f"heaviest call OI build at {oi_bias['resistance_strike']:.0f} (possible resistance)")
+        if oi_bias.get("support_strike") is not None:
+            parts.append(f"heaviest put OI build at {oi_bias['support_strike']:.0f} (possible support)")
+        lines.append(
+            "Option chain: " + "; ".join(parts) + ". Raw OI change can't distinguish buying from writing, "
+            "so read these as rough zones to watch, not confirmed walls."
+        )
+
+    return {
+        "connected": True,
+        "implied_points": implied_points, "verdict": verdict,
+        "spot": spot, "max_pain": max_pain, "oi_bias": oi_bias,
+        "predictive_lines": lines,
+    }
+
+
 # ---------------- Full Nifty 50 constituent board (unweighted) ----------------
 # Best-effort snapshot of current Nifty 50 membership, symbol/ISIN pairs
 # only -- unlike NIFTY_TOP10 above, this deliberately carries no per-stock

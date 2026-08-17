@@ -1048,6 +1048,97 @@ function Nifty50Panel() {
   );
 }
 
+/* ---------- predictive signal: movers + max pain + OI change ----------
+   Reads api/index.py's /api/upstox/predictive, which combines three
+   things: the top-10 weighted implied move (the only one with backtested
+   accuracy -- see BacktestPanel below), max pain, and OI-change bias
+   (both derived from the live NIFTY option chain). The backend
+   deliberately keeps these three as separate predictive_lines rather
+   than blending them into one score -- max pain/OI bias are classic
+   heuristics, not backtested, so this panel renders them as supporting
+   context under the primary line rather than equal-weight signals. */
+const PREDICTIVE_POLL_MS = 15000;
+
+function PredictivePanel() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const fetchInFlight = useRef(false);
+
+  useEffect(() => {
+    const tick = async () => {
+      if (fetchInFlight.current) return;
+      fetchInFlight.current = true;
+      try {
+        const res = await fetch(`${PCR_API_BASE}/upstox/predictive`);
+        setData(await res.json());
+      } catch {
+        // background tick -- not worth surfacing an error banner for
+      } finally {
+        setLoading(false);
+        fetchInFlight.current = false;
+      }
+    };
+    tick();
+    const id = setInterval(tick, PREDICTIVE_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div style={{ gridColumn: "1 / -1" }}>
+      <Panel
+        title="Predictive signal (movers + max pain + OI)"
+        right={
+          <span
+            style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: data?.connected ? T.cyan : T.amber }}
+            title={data?.connected ? "Live via your connected Upstox account" : "Upstox not connected — visit /api/upstox/login"}
+          >
+            {data?.connected ? "via Upstox" : "not connected"}
+          </span>
+        }
+      >
+        {loading ? (
+          <EmptyNote>Loading…</EmptyNote>
+        ) : !data?.connected ? (
+          <EmptyNote>{data?.error || "Upstox not connected — visit /api/upstox/login to see the predictive signal."}</EmptyNote>
+        ) : (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginBottom: 16 }}>
+              <Row label="Spot" value={data.spot != null ? fmtNum(data.spot, 2) : "—"} />
+              <Row label="Max pain" value={data.max_pain != null ? fmtNum(data.max_pain, 0) : "—"} />
+              <Row
+                label="Implied move" color={directionColor(data.implied_points)}
+                value={data.implied_points != null ? `${fmtSigned(data.implied_points, 0)} pts` : "—"}
+              />
+              <Row label="Resistance (OI)" value={data.oi_bias?.resistance_strike != null ? fmtNum(data.oi_bias.resistance_strike, 0) : "—"} />
+              <Row label="Support (OI)" value={data.oi_bias?.support_strike != null ? fmtNum(data.oi_bias.support_strike, 0) : "—"} />
+            </div>
+
+            {data.verdict && (
+              <div style={{ marginBottom: 12 }}>
+                <Chip color={VERDICT_COLOR[data.verdict] || T.muted}>{VERDICT_EMOJI[data.verdict]} {data.verdict}</Chip>
+              </div>
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {(data.predictive_lines || []).map((line, i) => (
+                <div key={i} style={{ fontFamily: DISP, fontSize: 13, color: i === 0 ? T.fg : T.muted, lineHeight: 1.5 }}>
+                  {i === 0 ? "▸ " : "· "}{line}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 14, fontFamily: DISP, fontSize: 11, color: T.muted }}>
+              Only the top line (top-10 weighted implied move) has backtested accuracy behind it (~85% directional, see the
+              backtest panel below). Max pain and OI-change bias are classic options heuristics shown as context, not
+              independently validated signals. Automated analysis for information only — not investment advice.
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 /* ---------- backtest: which stocks drive big 5-min Nifty moves ----------
    Reads api/index.py's /api/upstox/movers/backtest -- a genuinely heavy
    call (11 parallel Upstox requests pulling a month of 5-min history), so
@@ -2110,6 +2201,7 @@ export default function App() {
           <LevelsPanel brief={brief} />
           <MoversPanel />
           <Nifty50Panel />
+          <PredictivePanel />
           <BacktestPanel />
           <div style={{ gridColumn: "1 / -1" }}>
             <PaperTradingPanel />
