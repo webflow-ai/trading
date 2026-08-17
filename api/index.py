@@ -616,7 +616,12 @@ async def upstox_movers():
             "error": "Upstox not connected — visit /api/upstox/login",
         }
 
-    instrument_keys = ",".join(f"NSE_EQ|{s['isin']}" for s in NIFTY_TOP10)
+    # NIFTY's own index instrument_key rides along in the same batch quote
+    # call (Upstox's quotes endpoint accepts a comma-separated list, so this
+    # costs nothing extra) -- its live LTP is what turns implied_move_pct
+    # into an actual points estimate (implied_points) below, rather than
+    # leaving the frontend to guess a Nifty level from something stale.
+    instrument_keys = ",".join([UPSTOX_UNDERLYING_KEY["NIFTY"]] + [f"NSE_EQ|{s['isin']}" for s in NIFTY_TOP10])
     try:
         async with httpx.AsyncClient(timeout=10) as up_client:
             resp = await up_client.get(
@@ -679,9 +684,19 @@ async def upstox_movers():
         })
 
     implied_move_pct = round(total_contribution, 3) if any_live else None
+
+    # implied_points converts the %-based signal into an actual Nifty-point
+    # estimate using NIFTY's own live LTP from this same batch call -- e.g.
+    # +0.15% implied on a ~24,400 Nifty is ~+36 points, which is the number
+    # a "expect a >=30pt move" alert actually wants, not a raw percentage.
+    nifty_quote = by_key.get(UPSTOX_UNDERLYING_KEY["NIFTY"])
+    nifty_spot = nifty_quote.get("last_price") if nifty_quote else None
+    implied_points = round(implied_move_pct / 100 * nifty_spot, 1) if implied_move_pct is not None and nifty_spot else None
+
     return {
         "connected": True, "stocks": stocks,
         "implied_move_pct": implied_move_pct, "verdict": _movers_verdict(implied_move_pct),
+        "nifty_spot": nifty_spot, "implied_points": implied_points,
     }
 
 

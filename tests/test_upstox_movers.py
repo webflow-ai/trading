@@ -118,6 +118,38 @@ def test_upstox_movers_computes_weighted_contribution_when_connected(monkeypatch
     assert body["implied_move_pct"] == round(expected_hdfc_contrib + expected_icici_contrib, 3)
     # confirms the Bearer token from upstox_token actually made it onto the request
     assert fake_client.calls[0][1]["headers"]["Authorization"] == "Bearer tok123"
+    # no NSE_INDEX|Nifty 50 entry in this fixture -- implied_points needs a
+    # live Nifty LTP to convert %, so it degrades to None rather than guessing
+    assert body["nifty_spot"] is None
+    assert body["implied_points"] is None
+
+
+def test_upstox_movers_converts_implied_pct_to_points_using_live_nifty_ltp(monkeypatch):
+    monkeypatch.setattr(index_module, "upstox_token", {"access_token": "tok123", "obtained_at": "now"})
+
+    hdfc = index_module.NIFTY_TOP10[0]
+    fake_response = FakeUpstoxResponse(200, {
+        "data": {
+            "NSE_INDEX:Nifty 50": {
+                "instrument_token": index_module.UPSTOX_UNDERLYING_KEY["NIFTY"],
+                "last_price": 24000.0,
+            },
+            "NSE_EQ:HDFCBANK": {
+                "instrument_token": f"NSE_EQ|{hdfc['isin']}",
+                "last_price": 1650.0,
+                "ohlc": {"close": 1600.0},  # +3.125% move
+            },
+        },
+    })
+    monkeypatch.setattr(index_module.httpx, "AsyncClient", lambda **kw: FakeUpstoxAsyncClient(fake_response))
+
+    r = client.get("/api/upstox/movers")
+    body = r.json()
+    assert body["nifty_spot"] == 24000.0
+    # implied_move_pct = 3.125 * hdfc_weight/100 (only stock with data); implied_points = that % of 24000
+    expected_points = round(body["implied_move_pct"] / 100 * 24000.0, 1)
+    assert body["implied_points"] == expected_points
+    assert body["implied_points"] > 0  # sanity: a real, non-trivial number, not None/0
 
 
 def test_upstox_movers_uses_net_change_not_ohlc_close_during_live_market(monkeypatch):

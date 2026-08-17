@@ -416,6 +416,48 @@ function ParticipantPanel({ brief }) {
 const MOVERS_POLL_MS = 5000;
 const MOVERS_SNAPSHOT_THROTTLE_MS = 5 * 60 * 1000;
 const MOVERS_HISTORY_POLL_MS = 60000;
+const MOVE_ALERT_DEFAULT_THRESHOLD_PTS = 30;
+
+// Non-blocking toast (not a modal -- it shouldn't interrupt whatever the
+// user's doing) shown when the live top-10 weighted signal crosses
+// alertThresholdPts, converted to real Nifty points via api/index.py's
+// implied_points (weight% x %change scaled by NIFTY's own live LTP, not a
+// raw percentage). Fires once per *new* direction, not on every 5s poll
+// tick the condition happens to still hold -- see MoversPanel's
+// lastAlertDirectionRef for the de-dup logic.
+function MoveAlertToast({ alert, onDismiss }) {
+  if (!alert) return null;
+  const color = alert.direction === "up" ? T.put : T.call;
+  return (
+    <div
+      style={{
+        position: "fixed", top: 16, right: 16, zIndex: 2000, width: 320,
+        background: T.panel, border: `1px solid ${color}`, borderRadius: 10, padding: "14px 16px",
+        boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+        <div>
+          <div style={{ fontFamily: DISP, fontSize: 13, fontWeight: 700, color }}>
+            {alert.direction === "up" ? "📈" : "📉"} Possible ≥{alert.thresholdPts}pt {alert.direction === "up" ? "rise" : "fall"}
+          </div>
+          <div style={{ fontFamily: MONO, fontSize: 13, color: T.fg, marginTop: 6 }}>
+            Implied ~{fmtSigned(alert.impliedPts, 0)} pts ({fmtSigned(alert.impliedPct, 3)}%) from top-10 weighted signal
+          </div>
+          <div style={{ fontFamily: DISP, fontSize: 10, color: T.muted, marginTop: 8, lineHeight: 1.4 }}>
+            Live pattern, not a guarantee — same weighted-contribution formula the backtest panel below scored ~85% directionally accurate.
+          </div>
+        </div>
+        <button
+          onClick={onDismiss} aria-label="Dismiss"
+          style={{ background: "transparent", border: "none", color: T.muted, cursor: "pointer", fontSize: 14, lineHeight: 1, flexShrink: 0 }}
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function StockAreaChart({ symbol, name, points, pctChange, onClick }) {
   const color = directionColor(pctChange);
@@ -669,14 +711,20 @@ function StockDetailModal({ symbol, name, ltp, pctChange, points, onClose }) {
 }
 
 function MoversPanel() {
-  const [data, setData] = useState(null); // { connected, stocks, implied_move_pct, verdict, error }
+  const [data, setData] = useState(null); // { connected, stocks, implied_move_pct, implied_points, verdict, error }
   const [history, setHistory] = useState(null); // { connected, series: { SYMBOL: [{t, close}, ...] } }
   const [accuracy, setAccuracy] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selectedSymbol, setSelectedSymbol] = useState(null);
+  const [alertThresholdPts, setAlertThresholdPts] = useState(MOVE_ALERT_DEFAULT_THRESHOLD_PTS);
+  const [activeAlert, setActiveAlert] = useState(null);
   const fetchInFlight = useRef(false);
   const historyFetchInFlight = useRef(false);
   const lastSnapshotAt = useRef(0);
+  // Tracks which direction (if any) the alert already fired for, so the
+  // toast reappears only on a *new* crossing (e.g. clear -> up, or
+  // up -> down) rather than every 5s poll tick the condition still holds.
+  const lastAlertDirectionRef = useRef(null);
 
   const loadAccuracy = useCallback(async () => {
     try {
@@ -697,6 +745,19 @@ function MoversPanel() {
         const json = await res.json();
         setData(json);
 
+        if (json.connected && json.implied_points != null) {
+          const direction = json.implied_points >= alertThresholdPts ? "up"
+            : json.implied_points <= -alertThresholdPts ? "down" : null;
+          if (direction && direction !== lastAlertDirectionRef.current) {
+            lastAlertDirectionRef.current = direction;
+            setActiveAlert({
+              direction, impliedPts: json.implied_points, impliedPct: json.implied_move_pct, thresholdPts: alertThresholdPts,
+            });
+          } else if (!direction) {
+            lastAlertDirectionRef.current = null; // condition cleared -- ready to fire again if it returns
+          }
+        }
+
         const now = Date.now();
         if (json.connected && json.implied_move_pct != null && now - lastSnapshotAt.current > MOVERS_SNAPSHOT_THROTTLE_MS) {
           lastSnapshotAt.current = now;
@@ -714,7 +775,7 @@ function MoversPanel() {
     tick();
     const id = setInterval(tick, MOVERS_POLL_MS);
     return () => clearInterval(id);
-  }, [loadAccuracy]);
+  }, [loadAccuracy, alertThresholdPts]);
 
   useEffect(() => {
     const tick = async () => {
@@ -748,12 +809,23 @@ function MoversPanel() {
       <Panel
         title="Top 10 Nifty movers (live)"
         right={
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             {accuracy?.hit_rate_pct != null && (
               <span title="Rolling hit-rate: this signal's predicted direction vs Nifty's actual next-day open, last 30 sessions">
                 <Chip color={T.cyan}>Predictor accuracy: {fmtNum(accuracy.hit_rate_pct, 1)}%</Chip>
               </span>
             )}
+            <label
+              title="Pop up a live alert whenever the implied move crosses this many Nifty points, in either direction"
+              style={{ fontFamily: DISP, fontSize: 11, color: T.muted, display: "flex", alignItems: "center", gap: 4 }}
+            >
+              alert ≥ pts
+              <input
+                type="number" min="5" max="500" value={alertThresholdPts}
+                onChange={(e) => setAlertThresholdPts(Number(e.target.value) || MOVE_ALERT_DEFAULT_THRESHOLD_PTS)}
+                style={{ ...formInputStyle, width: 52, padding: "3px 6px" }}
+              />
+            </label>
             <span
               style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: data?.connected ? T.cyan : T.amber }}
               title={data?.connected ? "Live via your connected Upstox account" : "Upstox not connected — visit /api/upstox/login to see live movers"}
@@ -773,6 +845,11 @@ function MoversPanel() {
               <div>
                 <div style={{ fontFamily: MONO, fontSize: 28, fontWeight: 700, color: directionColor(data.implied_move_pct) }}>
                   {fmtSigned(data.implied_move_pct, 2)}%
+                  {data.implied_points != null && (
+                    <span style={{ fontSize: 16, marginLeft: 8, color: directionColor(data.implied_points) }}>
+                      ({fmtSigned(data.implied_points, 0)} pts)
+                    </span>
+                  )}
                 </div>
                 <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>implied move from top-10 weight</div>
               </div>
@@ -870,6 +947,7 @@ function MoversPanel() {
           </>
         )}
       </Panel>
+      <MoveAlertToast alert={activeAlert} onDismiss={() => setActiveAlert(null)} />
     </div>
   );
 }
