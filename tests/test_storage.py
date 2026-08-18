@@ -140,13 +140,22 @@ def test_save_macro_snapshots_skips_empty_quotes(fake_client):
 
 def test_save_morning_brief_upserts_on_trade_date(fake_client):
     brief = {"trade_date": "2026-08-10", "score": 42, "verdict": "Gap-up likely",
-              "expected_low": 24400, "expected_high": 24700, "components": {}, "headlines": []}
+              "expected_low": 24400, "expected_high": 24700, "predicted_open": 24550,
+              "components": {"outlook": {"headline": "x"}}, "headlines": [],
+              "news_sentiment": "mild", "outlook": {"headline": "x"}, "disclaimer": "nope"}
     asyncio.run(storage.save_morning_brief(brief))
 
     method, url, kwargs = fake_client.calls[0]
     assert url == "https://fake.supabase.co/rest/v1/morning_briefs"
     assert kwargs["params"] == {"on_conflict": "trade_date"}
-    assert kwargs["json"] == brief
+    # Response-only keys must not be written as columns.
+    assert kwargs["json"] == {
+        "trade_date": "2026-08-10", "score": 42, "verdict": "Gap-up likely",
+        "expected_low": 24400, "expected_high": 24700, "predicted_open": 24550,
+        "components": {"outlook": {"headline": "x"}}, "headlines": [], "news_sentiment": "mild",
+    }
+    assert "outlook" not in kwargs["json"] or "headline" in kwargs["json"]["components"]["outlook"]
+    assert "disclaimer" not in kwargs["json"]
 
 
 def test_get_brief_history_orders_desc_and_limits(monkeypatch):

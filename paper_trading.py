@@ -33,6 +33,7 @@ async def open_trade(
     lots: int = 1, lot_size: int = DEFAULT_LOT_SIZE, symbol: str = "NIFTY",
     trade_date: str | None = None, notes: str | None = None,
     stop_loss: float | None = None, target_price: float | None = None,
+    expiry: str | None = None,
 ) -> dict:
     trade_date = trade_date or dt.datetime.now(IST).date().isoformat()
     row = {
@@ -49,6 +50,7 @@ async def open_trade(
         "notes": notes,
         "stop_loss": stop_loss,
         "target_price": target_price,
+        "expiry": expiry,
     }
     return await storage.create_paper_trade(row)
 

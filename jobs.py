@@ -216,6 +216,10 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
         "headlines": news["headlines"],
         "news_sentiment": news["news_sentiment"],
     }
+    # Plain-language open scenario for the dashboard / Telegram — built after
+    # components are assembled so it can cite GIFT, FII, levels, news, etc.
+    brief["outlook"] = scoring.build_tomorrow_outlook(brief)
+    brief["components"]["outlook"] = brief["outlook"]
 
     await storage.save_morning_brief(brief)
     result = {**brief, "disclaimer": scoring.DISCLAIMER}
@@ -227,3 +231,118 @@ async def run_morning_job(is_event_day: bool = False) -> dict:
         result["telegram_sent"] = False
 
     return result
+
+
+async def compute_live_score() -> dict:
+    """Lightweight open-bias refresh for the dashboard: re-fetch GIFT +
+    US/Asia/macro quotes, reuse latest FII positioning from storage, and
+    recompute score/verdict/predicted open without persisting a new brief.
+
+    The morning brief remains the official daily snapshot; this is a live
+    overlay so the score dial can move as overnight cues change.
+    """
+    now = dt.datetime.now(IST)
+    rows = await storage.get_brief_history(days=1)
+    brief = rows[0] if rows else {}
+    components = brief.get("components") or {}
+    previous_close = components.get("previous_close")
+    is_event_day = bool(components.get("is_event_day"))
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        gift, us_quotes, asia_quotes, macro_quotes = await asyncio.gather(
+            market_data.fetch_gift_nifty(client),
+            _fetch_quotes(client, US_SYMBOLS),
+            _fetch_quotes(client, ASIA_SYMBOLS),
+            _fetch_quotes(client, MACRO_SYMBOLS),
+        )
+
+    fii = await positioning.compute_fii_positioning()
+    crude = macro_quotes.get("crude")
+    usdinr = macro_quotes.get("usdinr")
+    dxy = macro_quotes.get("dxy")
+    us10y = macro_quotes.get("us10y")
+
+    inputs = {
+        "previous_close": previous_close,
+        "gift_price": gift.get("price") if gift else None,
+        "us_quotes": us_quotes,
+        "asia_quotes": asia_quotes,
+        "crude_pct_change": crude.get("pct_change") if crude else None,
+        "usdinr_pct_change": usdinr.get("pct_change") if usdinr else None,
+        "dxy_pct_change": dxy.get("pct_change") if dxy else None,
+        "us10y_change_bps": (
+            (us10y.get("price") - us10y.get("previous_close")) * 100 if us10y else None
+        ),
+        "fii_ratio": fii.get("ratio") if fii else None,
+        "fii_trend": fii.get("trend") if fii else None,
+        "is_event_day": is_event_day,
+    }
+
+    score_result = scoring.compute_score(inputs)
+    predicted = scoring.compute_predicted_open(
+        previous_close=previous_close,
+        gift_price=inputs["gift_price"],
+        score=score_result["score"],
+    )
+
+    gift_component = {**(score_result["components"].get("gift") or {})}
+    if gift and gift.get("price") is not None:
+        gift_component["price"] = gift["price"]
+        gift_component["change"] = gift.get("change")
+
+    live_brief = {
+        "score": score_result["score"],
+        "verdict": score_result["verdict"],
+        "predicted_open": predicted["value"] if predicted else None,
+        "expected_low": brief.get("expected_low"),
+        "expected_high": brief.get("expected_high"),
+        "news_sentiment": brief.get("news_sentiment"),
+        "components": {
+            **components,
+            **score_result["components"],
+            "gift": gift_component,
+            "confidence": score_result["confidence"],
+            "missing": score_result["missing"],
+            "is_event_day": is_event_day,
+            "previous_close": previous_close,
+            "us_quotes": us_quotes,
+            "asia_quotes": asia_quotes,
+            "macro_quotes": macro_quotes,
+            "predicted_open_method": predicted["method"] if predicted else None,
+            "fii": score_result["components"].get("fii") or components.get("fii"),
+            "participants": components.get("participants") or {},
+            "participants_trade_date": components.get("participants_trade_date"),
+            "fii_dii_cash": components.get("fii_dii_cash"),
+            "levels": components.get("levels"),
+            "structure": components.get("structure"),
+        },
+    }
+    outlook = scoring.build_tomorrow_outlook(live_brief)
+
+    return {
+        "live": True,
+        "score": score_result["score"],
+        "verdict": score_result["verdict"],
+        "confidence": score_result["confidence"],
+        "missing": score_result["missing"],
+        "predicted_open": predicted["value"] if predicted else None,
+        "predicted_open_method": predicted["method"] if predicted else None,
+        "brief_score": brief.get("score"),
+        "brief_verdict": brief.get("verdict"),
+        "gift": {
+            "available": bool(gift and gift.get("price") is not None),
+            "price": gift.get("price") if gift else None,
+            "change": gift.get("change") if gift else None,
+            "fair_value": gift_component.get("fair_value"),
+            "gap_pct": gift_component.get("gap_pct"),
+            "previous_close": previous_close,
+            "predicted_open": predicted["value"] if predicted else None,
+        },
+        "outlook": outlook,
+        "components": score_result["components"],
+        "us_quotes": us_quotes,
+        "asia_quotes": asia_quotes,
+        "macro_quotes": macro_quotes,
+        "fetched_at": now.isoformat(),
+        "disclaimer": scoring.DISCLAIMER,
+    }

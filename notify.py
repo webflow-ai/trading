@@ -74,13 +74,35 @@ def format_brief_message(brief: dict) -> str:
     news_line = brief.get("news_sentiment") or "unavailable (news classifier not wired up yet)"
     disclaimer = brief.get("disclaimer") or scoring.DISCLAIMER
 
+    outlook = brief.get("outlook") or components.get("outlook") or {}
+
     lines = [f"{emoji} {verdict} (score {score:+.1f})", ""]
-    if signals:
+    if outlook.get("headline"):
+        lines.append(outlook["headline"])
+    if outlook.get("open_expectation"):
+        lines.append(outlook["open_expectation"])
+        lines.append("")
+    if outlook.get("why"):
+        lines.append("Why:")
+        lines.extend(f"• {w}" for w in outlook["why"][:5])
+        lines.append("")
+    elif signals:
         lines.append("Top signals:")
         lines.extend(f"{i}. {s}" for i, s in enumerate(signals, start=1))
         lines.append("")
+    if outlook.get("key_levels"):
+        lines.append("Levels: " + " | ".join(outlook["key_levels"]))
+        lines.append("")
+    if outlook.get("first_hour_plan"):
+        lines.append("First hour:")
+        lines.extend(f"• {p}" for p in outlook["first_hour_plan"])
+        lines.append("")
     lines.append(f"Expected range: {range_line}")
     lines.append(f"News sentiment: {news_line}")
+    if outlook.get("confidence_note"):
+        lines.append(outlook["confidence_note"])
+    if outlook.get("scope"):
+        lines.append(outlook["scope"])
     lines.append("")
     lines.append(disclaimer)
     return "\n".join(lines)

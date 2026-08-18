@@ -158,3 +158,102 @@ def test_fii_dii_cash_snapshot_none_when_nothing_persisted(monkeypatch):
     monkeypatch.setattr(positioning.storage, "get_latest_fii_dii_cash", fake_get_latest_fii_dii_cash)
 
     assert asyncio.run(positioning.fii_dii_cash_snapshot()) is None
+
+
+def test_build_positioning_outlook_bullish_when_fii_long_and_rising():
+    outlook = positioning.build_positioning_outlook(
+        {"trade_date": "2026-08-10", "participants": {
+            "FII": {"ratio": 58.0, "trend": "rising"},
+            "Client": {"ratio": 42.0},
+        }},
+        cash={"fii_buy": 1000, "fii_sell": 800, "dii_buy": 500, "dii_sell": 600},
+        fii={"ratio": 58.0, "trend": "rising"},
+    )
+    assert outlook["bias"] == "bullish"
+    assert "bullish" in outlook["headline"].lower() or "net long" in outlook["headline"].lower()
+    assert "supportive" in outlook["what_to_expect"].lower() or "long" in outlook["what_to_expect"].lower()
+    assert any("FII" in w for w in outlook["why"])
+    assert any("Clients" in w for w in outlook["why"])
+    assert outlook["scope"]
+
+
+def test_build_positioning_outlook_bearish_when_fii_short_and_falling():
+    outlook = positioning.build_positioning_outlook(
+        {"trade_date": "2026-08-10", "participants": {"FII": {"ratio": 40.0, "trend": "falling"}}},
+        fii={"ratio": 40.0, "trend": "falling"},
+    )
+    assert outlook["bias"] == "bearish"
+    assert "soft" in outlook["what_to_expect"].lower() or "short" in outlook["what_to_expect"].lower()
+
+
+def test_build_positioning_outlook_flags_client_fii_split():
+    outlook = positioning.build_positioning_outlook(
+        {"participants": {
+            "FII": {"ratio": 40.0, "trend": "flat"},
+            "Client": {"ratio": 60.0},
+        }},
+        fii={"ratio": 40.0, "trend": "flat"},
+    )
+    assert any("Classic split" in w or "Clients long-heavy" in w for w in outlook["why"])
+
+
+def test_build_positioning_outlook_empty():
+    outlook = positioning.build_positioning_outlook({"participants": {}})
+    assert outlook["bias"] == "neutral"
+    assert "unavailable" in outlook["headline"].lower()
+
+
+def test_refresh_positioning_from_nse_persists_and_builds_outlook(monkeypatch):
+    import pandas as pd
+
+    df = _sample_df()
+
+    def fake_fetch():
+        return df, {"date": "10-Aug-2026", "fii_buy": 1, "fii_sell": 2, "dii_buy": 3, "dii_sell": 4}, None, None
+
+    # Patch the inner fetch used by refresh — replace NSEClient path via to_thread body
+    async def fake_to_thread(fn):
+        return fake_fetch()
+
+    saved = {}
+
+    async def fake_save_participant_oi(frame):
+        saved["oi"] = True
+
+    async def fake_save_fii_dii_cash(data):
+        saved["cash"] = data
+
+    async def fake_participant_snapshot(days=5):
+        return {
+            "trade_date": "2026-08-10",
+            "participants": {
+                "FII": {"long": 300000, "short": 250000, "ratio": 54.55, "trend": "rising"},
+                "Client": {"long": 1, "short": 2, "ratio": 33.33, "trend": None},
+            },
+        }
+
+    async def fake_fii_dii_cash_snapshot():
+        return {"trade_date": "2026-08-10", "fii_buy": 1, "fii_sell": 2, "dii_buy": 3, "dii_sell": 4}
+
+    async def fake_compute_fii_positioning(days=5):
+        return {"ratio": 54.55, "trend": "rising"}
+
+    async def fake_get_fii_trend(days=30):
+        return [{"trade_date": "2026-08-10", "future_index_long": 300000, "future_index_short": 250000}]
+
+    monkeypatch.setattr(positioning.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(positioning.storage, "save_participant_oi", fake_save_participant_oi)
+    monkeypatch.setattr(positioning.storage, "save_fii_dii_cash", fake_save_fii_dii_cash)
+    monkeypatch.setattr(positioning, "participant_snapshot", fake_participant_snapshot)
+    monkeypatch.setattr(positioning, "fii_dii_cash_snapshot", fake_fii_dii_cash_snapshot)
+    monkeypatch.setattr(positioning, "compute_fii_positioning", fake_compute_fii_positioning)
+    monkeypatch.setattr(positioning.storage, "get_fii_trend", fake_get_fii_trend)
+
+    result = asyncio.run(positioning.refresh_positioning_from_nse(persist=True))
+    assert result["available"] is True
+    assert result["from_nse"] is True
+    assert saved.get("oi") is True
+    assert saved.get("cash")
+    assert result["outlook"]["bias"] in ("bullish", "neutral", "bearish")
+    assert result["participants"]["FII"]["ratio"] == 54.55
+    assert "fetched_at" in result

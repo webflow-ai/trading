@@ -112,6 +112,92 @@ function EmptyNote({ children }) {
   return <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, padding: "8px 0" }}>{children}</div>;
 }
 
+/* ---------- plain-language open outlook (mirrors scoring.build_tomorrow_outlook) ---------- */
+// Used when an older brief was persisted before the backend started storing
+// `outlook` — so the dashboard still explains "what to expect tomorrow"
+// from fields already on the brief.
+function buildTomorrowOutlookClient(brief) {
+  if (!brief || brief.score == null) return null;
+  const c = brief.components || {};
+  const verdict = brief.verdict || "Flat open";
+  const score = brief.score;
+  const pred = brief.predicted_open;
+  const prev = c.previous_close;
+  const levels = c.levels || {};
+  const gift = c.gift || {};
+  const usAsia = c.us_asia || {};
+  const macro = c.macro || {};
+  const fii = c.fii || {};
+  const fmt = (x) => (x == null || Number.isNaN(Number(x)) ? null : Number(x).toLocaleString("en-IN", { maximumFractionDigits: 0 }));
+  const tone = (s) => (s == null ? "mixed" : s > 0.25 ? "supportive" : s < -0.25 ? "pressuring" : "mixed");
+  const predS = fmt(pred), prevS = fmt(prev);
+  const lowS = fmt(brief.expected_low), highS = fmt(brief.expected_high);
+  const pdhS = fmt(levels.pdh), pdlS = fmt(levels.pdl);
+
+  let headline, openExpectation, firstHour;
+  if (verdict === "Gap-up likely") {
+    headline = "Tomorrow leans gap-up / constructive open";
+    openExpectation = `Expect Nifty to open above prior close${predS ? ` (~${predS})` : ""}, with early buyers favoured if the open holds.`;
+    firstHour = [
+      "If price holds above the predicted open / prior close in the first 15–30 min, dips toward that level are the usual long-side watch.",
+      "If the gap fails quickly and slips back under prior close, treat the open bias as cancelled — wait for structure.",
+    ];
+  } else if (verdict === "Gap-down likely") {
+    headline = "Tomorrow leans gap-down / soft open";
+    openExpectation = `Expect Nifty to open below prior close${predS ? ` (~${predS})` : ""}, with early sellers favoured if the open holds.`;
+    firstHour = [
+      "If price stays below the predicted open / prior close in the first 15–30 min, bounces into that zone are the usual short-side watch.",
+      "If the gap is bought aggressively and reclaims prior close, treat the soft-open bias as cancelled — wait for structure.",
+    ];
+  } else {
+    headline = "Tomorrow leans flat / indecisive open";
+    openExpectation = `Expect Nifty to open near prior close${predS ? ` (~${predS})` : ""} — no strong overnight edge; wait for the first impulse.`;
+    firstHour = [
+      "Avoid chasing the first spike; let 9:15–9:45 IST define direction.",
+      "Trade the break/hold of the opening range or a clear reclaim of prior day high/low rather than the open print itself.",
+    ];
+  }
+
+  const why = [];
+  if (gift.gap_pct != null) {
+    why.push(`GIFT Nifty is ${tone(gift.score)} (gap ${gift.gap_pct >= 0 ? "+" : ""}${Number(gift.gap_pct).toFixed(2)}% vs fair value${gift.price != null ? `, last ${Number(gift.price).toLocaleString("en-IN")}` : ""}) — this is the strongest open cue.`);
+  }
+  if (usAsia.score != null) {
+    const bits = [];
+    if (usAsia.us_avg_pct != null) bits.push(`US ${usAsia.us_avg_pct >= 0 ? "+" : ""}${Number(usAsia.us_avg_pct).toFixed(2)}%`);
+    if (usAsia.asia_avg_pct != null) bits.push(`Asia ${usAsia.asia_avg_pct >= 0 ? "+" : ""}${Number(usAsia.asia_avg_pct).toFixed(2)}%`);
+    why.push(`Overnight equities are ${tone(usAsia.score)}${bits.length ? ` (${bits.join(", ")})` : ""}.`);
+  }
+  if (macro.score != null) why.push(`Macro is ${tone(macro.score)} for Nifty.`);
+  if (fii.ratio != null) {
+    why.push(`FII index futures are ${fii.ratio >= 50 ? "net long" : "net short"} (${Number(fii.ratio).toFixed(1)}% long/short, trend ${fii.trend || "flat"}) — positioning bias only, not an intraday trigger.`);
+  }
+  if (brief.news_sentiment) why.push(`News tone: ${brief.news_sentiment}`);
+
+  const keyLevels = [];
+  if (predS && prevS) keyLevels.push(`Predicted open ~${predS} (prior close ${prevS})`);
+  else if (predS) keyLevels.push(`Predicted open ~${predS}`);
+  else if (prevS) keyLevels.push(`Prior close ${prevS}`);
+  if (lowS && highS) keyLevels.push(`Expected reaction band ${lowS} – ${highS}`);
+  if (pdlS && pdhS) keyLevels.push(`Prior day low/high ${pdlS} / ${pdhS}`);
+
+  const confidence = c.confidence || "medium";
+  let confidenceNote = confidence === "high"
+    ? "Inputs are mostly complete — use as the base open plan, still confirm at 9:15."
+    : confidence === "low"
+      ? "Confidence is low (missing data and/or event day) — treat this as a soft sketch, not a plan."
+      : "Confidence is medium — some inputs missing; size down conviction until the open confirms.";
+  if (c.is_event_day) confidenceNote += " Event/expiry day: expect wider swings; the range is already widened.";
+
+  return {
+    headline: `${headline} (score ${score >= 0 ? "+" : ""}${Math.round(score)})`,
+    open_expectation: openExpectation,
+    why, key_levels: keyLevels, first_hour_plan: firstHour,
+    confidence_note: confidenceNote,
+    scope: "Open + first hour only — not a full-day prediction.",
+  };
+}
+
 /* ---------- verdict card ---------- */
 function CardIconButton({ onClick, title, active, children }) {
   return (
@@ -147,7 +233,7 @@ function CardCornerButtons({ showHistory, onToggleHistory, onRefresh, refreshing
   );
 }
 
-function VerdictCard({ brief, showHistory, onToggleHistory, onRefresh, refreshing }) {
+function VerdictCard({ brief, liveGift, liveScore, showHistory, onToggleHistory, onRefresh, refreshing }) {
   if (!brief || brief.score == null) {
     return (
       <div style={{ gridColumn: "1 / -1", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 16, padding: 24, position: "relative" }}>
@@ -158,49 +244,129 @@ function VerdictCard({ brief, showHistory, onToggleHistory, onRefresh, refreshin
       </div>
     );
   }
-  const color = VERDICT_COLOR[brief.verdict] || T.muted;
-  const confidence = brief.components?.confidence;
-  const missing = brief.components?.missing || [];
+  const score = liveScore?.score ?? brief.score;
+  const verdict = liveScore?.verdict ?? brief.verdict;
+  const confidence = liveScore?.confidence ?? brief.components?.confidence;
+  const missing = liveScore?.missing ?? brief.components?.missing ?? [];
+  const color = VERDICT_COLOR[verdict] || T.muted;
+  const outlook = liveScore?.outlook || brief.outlook || brief.components?.outlook || buildTomorrowOutlookClient(brief);
+  const livePredicted = liveScore?.predicted_open ?? (liveGift?.available ? liveGift.predicted_open : null);
+  const predictedOpen = livePredicted ?? brief.predicted_open;
+  const predictedLive = livePredicted != null;
+  const scoreLive = liveScore?.score != null;
   return (
     <div style={{
       gridColumn: "1 / -1", background: T.panel, border: `1px solid ${color}55`, borderRadius: 16, padding: 24,
-      display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap", position: "relative",
+      display: "flex", flexDirection: "column", gap: 18, position: "relative",
     }}>
       <CardCornerButtons showHistory={showHistory} onToggleHistory={onToggleHistory} onRefresh={onRefresh} refreshing={refreshing} />
-      <div style={{
-        width: 108, height: 108, borderRadius: "50%", border: `3px solid ${color}`, display: "flex",
-        flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0,
-      }}>
-        <div style={{ fontFamily: MONO, fontSize: 26, fontWeight: 700, color }}>{fmtSigned(brief.score, 0)}</div>
-        <div style={{ fontFamily: DISP, fontSize: 9, color: T.muted, letterSpacing: 0.6 }}>SCORE</div>
-      </div>
-      <div style={{ flex: 1, minWidth: 220 }}>
-        <div style={{ fontFamily: DISP, fontSize: 22, fontWeight: 700, color: T.fg }}>
-          {VERDICT_EMOJI[brief.verdict] || "⚪"} {brief.verdict}
-        </div>
-        {brief.predicted_open != null && (
-          <div style={{ fontFamily: MONO, fontSize: 20, fontWeight: 700, color: T.cyan, marginTop: 8 }}>
-            ~{fmtNum(brief.predicted_open, 0)}
-            <span style={{ fontFamily: DISP, fontSize: 11, fontWeight: 400, color: T.muted, marginLeft: 8 }}>
-              predicted open ({brief.components?.predicted_open_method === "gift_anchored" ? "from GIFT Nifty" : "from score"})
-            </span>
+      <div style={{ display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
+        <div style={{
+          width: 108, height: 108, borderRadius: "50%", border: `3px solid ${color}`, display: "flex",
+          flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0,
+        }}>
+          <div style={{ fontFamily: MONO, fontSize: 26, fontWeight: 700, color }}>{fmtSigned(score, 0)}</div>
+          <div style={{ fontFamily: DISP, fontSize: 9, color: T.muted, letterSpacing: 0.6 }}>
+            {scoreLive ? "LIVE" : "SCORE"}
           </div>
-        )}
-        <div style={{ fontFamily: MONO, fontSize: 13, color: T.muted, marginTop: 6 }}>
-          Range{" "}
-          {brief.expected_low != null && brief.expected_high != null
-            ? `${fmtNum(brief.expected_low, 0)} – ${fmtNum(brief.expected_high, 0)}`
-            : "unavailable"}
         </div>
-        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-          {confidence && <Chip color={CONFIDENCE_COLOR[confidence] || T.muted}>Confidence: {confidence}</Chip>}
-          {missing.length > 0 && <Chip color={T.amber}>Missing: {missing.join(", ")}</Chip>}
-          {brief.components?.is_event_day && <Chip color={T.amber}>Event day — range widened</Chip>}
+        <div style={{ flex: 1, minWidth: 220 }}>
+          <div style={{ fontFamily: DISP, fontSize: 22, fontWeight: 700, color: T.fg }}>
+            {VERDICT_EMOJI[verdict] || "⚪"} {verdict}
+            {scoreLive && <span style={{ marginLeft: 8 }}><Chip color={T.cyan}>live · 1m</Chip></span>}
+          </div>
+          {predictedOpen != null && (
+            <div style={{ fontFamily: MONO, fontSize: 20, fontWeight: 700, color: T.cyan, marginTop: 8 }}>
+              ~{fmtNum(predictedOpen, 0)}
+              <span style={{ fontFamily: DISP, fontSize: 11, fontWeight: 400, color: T.muted, marginLeft: 8 }}>
+                predicted open ({predictedLive ? "live GIFT" : brief.components?.predicted_open_method === "gift_anchored" ? "from GIFT Nifty" : "from score"})
+              </span>
+            </div>
+          )}
+          {(liveScore?.gift?.available || liveGift?.available) && (liveScore?.gift?.price ?? liveGift?.price) != null && (
+            <div style={{ fontFamily: MONO, fontSize: 13, color: T.fg, marginTop: 6 }}>
+              GIFT{" "}
+              <span style={{ color: (liveScore?.gift?.change ?? liveGift?.change) != null ? directionColor(liveScore?.gift?.change ?? liveGift?.change) : T.fg, fontWeight: 700 }}>
+                {fmtNum(liveScore?.gift?.price ?? liveGift?.price, 1)}
+              </span>
+              {(liveScore?.gift?.change ?? liveGift?.change) != null && (
+                <span style={{ color: directionColor(liveScore?.gift?.change ?? liveGift?.change), marginLeft: 8 }}>
+                  {fmtSigned(liveScore?.gift?.change ?? liveGift?.change, 1)}
+                </span>
+              )}
+              <Chip color={T.cyan}>live</Chip>
+            </div>
+          )}
+          <div style={{ fontFamily: MONO, fontSize: 13, color: T.muted, marginTop: 6 }}>
+            Range{" "}
+            {brief.expected_low != null && brief.expected_high != null
+              ? `${fmtNum(brief.expected_low, 0)} – ${fmtNum(brief.expected_high, 0)}`
+              : "unavailable"}
+            {scoreLive && brief.score != null && liveScore.score !== brief.score && (
+              <span style={{ marginLeft: 10 }}>morning brief was {fmtSigned(brief.score, 0)}</span>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+            {confidence && <Chip color={CONFIDENCE_COLOR[confidence] || T.muted}>Confidence: {confidence}</Chip>}
+            {missing.length > 0 && <Chip color={T.amber}>Missing: {missing.join(", ")}</Chip>}
+            {(liveScore?.components ? liveScore : brief.components)?.is_event_day && <Chip color={T.amber}>Event day — range widened</Chip>}
+          </div>
+        </div>
+        <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, maxWidth: 220, borderLeft: `1px solid ${T.line}`, paddingLeft: 20, paddingTop: 24, paddingRight: 50 }}>
+          {brief.disclaimer || "Automated analysis for information only — not investment advice."}
         </div>
       </div>
-      <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, maxWidth: 220, borderLeft: `1px solid ${T.line}`, paddingLeft: 20, paddingTop: 24, paddingRight: 50 }}>
-        {brief.disclaimer || "Automated analysis for information only — not investment advice."}
-      </div>
+
+      {outlook && (
+        <div style={{
+          borderTop: `1px solid ${T.line}`, paddingTop: 16, paddingRight: 50,
+          display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16,
+        }}>
+          <div style={{ gridColumn: "1 / -1" }}>
+            <div style={{ fontFamily: DISP, fontSize: 11, letterSpacing: 0.8, color: T.cyan, textTransform: "uppercase", marginBottom: 6 }}>
+              What to expect tomorrow
+            </div>
+            <div style={{ fontFamily: DISP, fontSize: 16, fontWeight: 700, color: T.fg, marginBottom: 6 }}>
+              {outlook.headline}
+            </div>
+            <div style={{ fontFamily: DISP, fontSize: 14, color: T.fg, lineHeight: 1.45 }}>
+              {outlook.open_expectation}
+            </div>
+            {outlook.scope && (
+              <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginTop: 6 }}>{outlook.scope}</div>
+            )}
+          </div>
+          {!!(outlook.why || []).length && (
+            <div>
+              <div style={{ fontFamily: DISP, fontSize: 11, letterSpacing: 0.6, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Why</div>
+              <ul style={{ margin: 0, paddingLeft: 18, fontFamily: DISP, fontSize: 13, color: T.fg, lineHeight: 1.5 }}>
+                {outlook.why.map((w, i) => <li key={i} style={{ marginBottom: 4 }}>{w}</li>)}
+              </ul>
+            </div>
+          )}
+          {!!(outlook.key_levels || []).length && (
+            <div>
+              <div style={{ fontFamily: DISP, fontSize: 11, letterSpacing: 0.6, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Key levels</div>
+              <ul style={{ margin: 0, paddingLeft: 18, fontFamily: MONO, fontSize: 12, color: T.fg, lineHeight: 1.55 }}>
+                {outlook.key_levels.map((w, i) => <li key={i} style={{ marginBottom: 4 }}>{w}</li>)}
+              </ul>
+            </div>
+          )}
+          {!!(outlook.first_hour_plan || []).length && (
+            <div>
+              <div style={{ fontFamily: DISP, fontSize: 11, letterSpacing: 0.6, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>First hour plan</div>
+              <ul style={{ margin: 0, paddingLeft: 18, fontFamily: DISP, fontSize: 13, color: T.fg, lineHeight: 1.5 }}>
+                {outlook.first_hour_plan.map((w, i) => <li key={i} style={{ marginBottom: 4 }}>{w}</li>)}
+              </ul>
+            </div>
+          )}
+          {outlook.confidence_note && (
+            <div style={{ gridColumn: "1 / -1", fontFamily: DISP, fontSize: 12, color: T.amber, lineHeight: 1.4 }}>
+              {outlook.confidence_note}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -214,27 +380,49 @@ function QuoteRow({ label, quote }) {
   return <Row label={label} value={`${fmtSigned(quote.pct_change)}%`} color={directionColor(quote.pct_change)} />;
 }
 
-function LiveCuesPanel({ brief }) {
+function LiveCuesPanel({ brief, liveGift, liveScore, giftUpdatedAt, giftRefreshing }) {
   const c = brief?.components || {};
-  const gift = c.gift;
+  const usQuotes = liveScore?.us_quotes || c.us_quotes;
+  const asiaQuotes = liveScore?.asia_quotes || c.asia_quotes;
+  // Prefer the live scrape; fall back to the morning-brief snapshot so the
+  // panel never goes blank between polls or if the live endpoint is down.
+  const giftPrice = liveGift?.price ?? liveScore?.gift?.price ?? c.gift?.price;
+  const giftGap = liveGift?.gap_pct ?? liveScore?.gift?.gap_pct ?? c.gift?.gap_pct;
+  const giftChange = liveGift?.change ?? liveScore?.gift?.change;
+  const live = !!(liveGift?.available || liveScore?.gift?.available) && giftPrice != null;
   return (
     <Panel title="Live cues">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4, gap: 8 }}>
+        <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, letterSpacing: 0.4 }}>
+          GIFT Nifty {live ? <Chip color={T.cyan}>live</Chip> : <Chip color={T.amber}>brief</Chip>}
+          {giftRefreshing && <span style={{ marginLeft: 6, color: T.muted }}>…</span>}
+        </div>
+        {giftUpdatedAt && (
+          <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted }}>
+            {giftUpdatedAt.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit" })} IST
+          </div>
+        )}
+      </div>
       <Row
         label="GIFT Nifty"
-        value={gift?.price != null ? fmtNum(gift.price, 1) : "unavailable"}
+        value={giftPrice != null ? fmtNum(giftPrice, 1) : "unavailable"}
+        color={giftChange != null ? directionColor(giftChange) : undefined}
       />
+      {giftChange != null && (
+        <Row label="GIFT change" value={fmtSigned(giftChange, 1)} color={directionColor(giftChange)} />
+      )}
       <Row
         label="GIFT gap vs fair value"
-        value={gift?.gap_pct != null ? `${fmtSigned(gift.gap_pct)}%` : "—"}
-        color={directionColor(gift?.gap_pct)}
+        value={giftGap != null ? `${fmtSigned(giftGap)}%` : "—"}
+        color={directionColor(giftGap)}
       />
       <div style={{ height: 10 }} />
       {Object.entries(US_LABELS).map(([k, label]) => (
-        <QuoteRow key={k} label={label} quote={c.us_quotes?.[k]} />
+        <QuoteRow key={k} label={label} quote={usQuotes?.[k]} />
       ))}
       <div style={{ height: 10 }} />
       {Object.entries(ASIA_LABELS).map(([k, label]) => (
-        <QuoteRow key={k} label={label} quote={c.asia_quotes?.[k]} />
+        <QuoteRow key={k} label={label} quote={asiaQuotes?.[k]} />
       ))}
     </Panel>
   );
@@ -243,10 +431,10 @@ function LiveCuesPanel({ brief }) {
 /* ---------- macro ---------- */
 const MACRO_LABELS = { crude: "Crude (Brent)", wti: "WTI", usdinr: "USD/INR", dxy: "DXY", us10y: "US 10Y" };
 
-function MacroPanel({ brief }) {
+function MacroPanel({ brief, liveScore }) {
   const c = brief?.components || {};
-  const flags = c.macro?.flags || {};
-  const quotes = c.macro_quotes || {};
+  const flags = (liveScore?.components?.macro?.flags) || c.macro?.flags || {};
+  const quotes = liveScore?.macro_quotes || c.macro_quotes || {};
   const keys = Object.keys(MACRO_LABELS).filter((k) => quotes[k] || flags[k] !== undefined);
   if (!keys.length) return <Panel title="Macro"><EmptyNote>No macro data yet.</EmptyNote></Panel>;
   return (
@@ -321,19 +509,23 @@ function FiiSparkline({ rows }) {
   );
 }
 
-function PositioningPanel({ brief, fiiRows }) {
+function PositioningPanel({ brief, fiiRows, livePositioning }) {
   const c = brief?.components || {};
-  const fii = c.fii;
+  const fii = livePositioning?.fii || c.fii;
   const opt = c.option_snapshot || {};
+  const rows = (livePositioning?.fii_rows && livePositioning.fii_rows.length)
+    ? livePositioning.fii_rows
+    : (fiiRows || []);
   return (
     <Panel title="Positioning">
-      <Row label="FII long/short ratio" value={fii?.ratio != null ? `${fmtNum(fii.ratio, 1)}%` : "unavailable"} />
+      <Row label="FII long/short ratio" value={fii?.ratio != null ? `${fmtNum(fii.ratio, 1)}%` : "unavailable"}
+        color={fii?.ratio != null ? directionColor(fii.ratio - 50) : undefined} />
       {fii?.trend && (
         <div style={{ padding: "6px 0" }}>
           <Chip color={TREND_COLOR[fii.trend] || T.muted}>Trend: {fii.trend}</Chip>
         </div>
       )}
-      <FiiSparkline rows={fiiRows || []} />
+      <FiiSparkline rows={rows} />
       <div style={{ height: 10 }} />
       <Row label="PCR" value={opt.pcr != null ? fmtNum(opt.pcr, 2) : "unavailable"} />
       <Row label="Max pain" value={opt.max_pain != null ? fmtNum(opt.max_pain, 0) : "unavailable"} />
@@ -345,55 +537,178 @@ function PositioningPanel({ brief, fiiRows }) {
 
 /* ---------- participant OI (Client/DII/FII/Pro) ---------- */
 const PARTICIPANT_ORDER = ["FII", "DII", "Pro", "Client"];
+const BIAS_COLOR = { bullish: T.put, bearish: T.call, neutral: T.amber };
+// How much each participant type matters for the Nifty open-bias score.
+// Only FII feeds scoring.compute_score (WEIGHTS.fii = 15); the rest are context.
+const NIFTY_PARTICIPANT_WEIGHT = {
+  FII: { pct: 15, label: "in Nifty score", scores: true },
+  DII: { pct: 0, label: "context", scores: false },
+  Pro: { pct: 0, label: "context", scores: false },
+  Client: { pct: 0, label: "context", scores: false },
+};
 
-function ParticipantPanel({ brief }) {
+function participantLean(ratio) {
+  if (ratio == null) return { text: "—", color: T.muted };
+  if (ratio >= 55) return { text: "LONG", color: T.put };
+  if (ratio <= 45) return { text: "SHORT", color: T.call };
+  return { text: "FLAT", color: T.amber };
+}
+
+function cashNetLabel(buy, sell) {
+  if (buy == null || sell == null) return null;
+  const net = buy - sell;
+  if (Math.abs(net) < 1e-9) return { text: "flat", color: T.muted, net: 0 };
+  return {
+    text: `${net > 0 ? "+" : ""}${fmtNum(net, 0)}`,
+    color: directionColor(net),
+    net,
+  };
+}
+
+function simplePositioningBias(participants, fii) {
+  const ratio = fii?.ratio ?? participants?.FII?.ratio;
+  const trend = fii?.trend ?? participants?.FII?.trend;
+  if (ratio == null) return { bias: "neutral", title: "No OI yet", line: "Waiting on NSE participant file." };
+  if (ratio >= 55 && trend === "rising") {
+    return { bias: "bullish", title: "Bullish for Nifty", line: "FII futures net long & rising." };
+  }
+  if (ratio >= 55) {
+    return { bias: "bullish", title: "Mildly bullish", line: "FII futures net long." };
+  }
+  if (ratio <= 45 && trend === "falling") {
+    return { bias: "bearish", title: "Bearish for Nifty", line: "FII futures net short & falling." };
+  }
+  if (ratio <= 45) {
+    return { bias: "bearish", title: "Mildly bearish", line: "FII futures net short." };
+  }
+  return { bias: "neutral", title: "Neutral for Nifty", line: "FII futures roughly balanced." };
+}
+
+function ParticipantPanel({ brief, livePositioning, liveScore, positioningUpdatedAt, positioningRefreshing }) {
   const c = brief?.components || {};
-  const participants = c.participants || {};
-  const asOf = c.participants_trade_date;
-  const cash = c.fii_dii_cash;
+  const participants = (livePositioning?.participants && Object.keys(livePositioning.participants).length)
+    ? livePositioning.participants
+    : (c.participants || {});
+  const asOf = livePositioning?.trade_date || c.participants_trade_date;
+  const cash = livePositioning?.fii_dii_cash || c.fii_dii_cash;
+  const fii = livePositioning?.fii || liveScore?.components?.fii || c.fii || participants.FII;
   const haveAny = Object.keys(participants).length > 0;
+  const fromNse = !!(livePositioning && livePositioning.from_nse);
+  const summary = simplePositioningBias(participants, fii);
+  const biasColor = BIAS_COLOR[summary.bias] || T.muted;
+
+  // FII's contribution to the live/open score (−15…+15 pts of the −100…+100 dial).
+  const fiiComp = liveScore?.components?.fii || c.fii;
+  const fiiScoreUnit = fiiComp?.score; // −1…+1
+  const fiiPoints = fiiScoreUnit != null ? Math.round(fiiScoreUnit * 15) : null;
+
+  const fiiCash = cashNetLabel(cash?.fii_buy, cash?.fii_sell);
+  const diiCash = cashNetLabel(cash?.dii_buy, cash?.dii_sell);
 
   return (
-    <Panel title="Participant OI (NSE)" right={asOf ? <span style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>as of {asOf}</span> : null}>
+    <Panel
+      title="Participant OI · Nifty"
+      right={
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {fromNse ? <Chip color={T.cyan}>NSE</Chip> : null}
+          {positioningRefreshing && <span style={{ fontFamily: MONO, fontSize: 10, color: T.muted }}>…</span>}
+          {asOf && <span style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>{asOf}</span>}
+        </div>
+      }
+    >
+      {/* One-glance Nifty read */}
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+        marginBottom: 14, padding: "12px 14px", borderRadius: 10,
+        background: `${biasColor}14`, border: `1px solid ${biasColor}44`,
+      }}>
+        <div>
+          <div style={{ fontFamily: DISP, fontSize: 16, fontWeight: 700, color: biasColor }}>{summary.title}</div>
+          <div style={{ fontFamily: DISP, fontSize: 12, color: T.fg, marginTop: 2 }}>{summary.line}</div>
+        </div>
+        <div style={{ textAlign: "right", flexShrink: 0 }}>
+          <div style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>FII weight</div>
+          <div style={{ fontFamily: MONO, fontSize: 18, fontWeight: 700, color: T.cyan }}>15%</div>
+          <div style={{ fontFamily: DISP, fontSize: 10, color: T.muted }}>of Nifty score</div>
+        </div>
+      </div>
+
+      {/* Score contribution bar */}
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+          <span style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>Nifty open score mix</span>
+          {fiiPoints != null && (
+            <span style={{ fontFamily: MONO, fontSize: 11, color: directionColor(fiiPoints), fontWeight: 700 }}>
+              FII now {fiiPoints >= 0 ? "+" : ""}{fiiPoints} pts
+            </span>
+          )}
+        </div>
+        <div style={{ display: "flex", height: 10, borderRadius: 6, overflow: "hidden", border: `1px solid ${T.line}` }}>
+          <div title="GIFT 40%" style={{ width: "40%", background: `${T.cyan}99` }} />
+          <div title="US/Asia 20%" style={{ width: "20%", background: `${T.amber}88` }} />
+          <div title="Macro 15%" style={{ width: "15%", background: `${T.muted}66` }} />
+          <div title="FII OI 15%" style={{ width: "15%", background: biasColor }} />
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 6, flexWrap: "wrap", fontFamily: DISP, fontSize: 10, color: T.muted }}>
+          <span><span style={{ color: T.cyan }}>■</span> GIFT 40%</span>
+          <span><span style={{ color: T.amber }}>■</span> US/Asia 20%</span>
+          <span><span style={{ color: T.muted }}>■</span> Macro 15%</span>
+          <span><span style={{ color: biasColor }}>■</span> FII OI 15%</span>
+        </div>
+      </div>
+
       {!haveAny ? (
-        <EmptyNote>No participant OI persisted yet — populated by the evening job.</EmptyNote>
+        <EmptyNote>No participant OI yet — refreshing from NSE.</EmptyNote>
       ) : (
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 12 }}>
-            <thead>
-              <tr style={{ color: T.muted, textAlign: "left" }}>
-                <th style={{ padding: "6px 8px", fontWeight: 500 }}>Participant</th>
-                <th style={{ padding: "6px 8px", fontWeight: 500 }}>Long</th>
-                <th style={{ padding: "6px 8px", fontWeight: 500 }}>Short</th>
-                <th style={{ padding: "6px 8px", fontWeight: 500 }}>Long/short %</th>
-                <th style={{ padding: "6px 8px", fontWeight: 500 }}>Trend</th>
-              </tr>
-            </thead>
-            <tbody>
-              {PARTICIPANT_ORDER.filter((p) => participants[p]).map((p) => (
-                <tr key={p} style={{ borderTop: `1px solid ${T.line}` }}>
-                  <td style={{ padding: "6px 8px", color: T.fg }}>{p}</td>
-                  <td style={{ padding: "6px 8px", color: T.fg }}>{fmtNum(participants[p].long, 0)}</td>
-                  <td style={{ padding: "6px 8px", color: T.fg }}>{fmtNum(participants[p].short, 0)}</td>
-                  <td style={{ padding: "6px 8px", color: participants[p].ratio != null ? directionColor(participants[p].ratio - 50) : T.muted }}>
-                    {participants[p].ratio != null ? `${fmtNum(participants[p].ratio, 1)}%` : "—"}
-                  </td>
-                  <td style={{ padding: "6px 8px" }}>
-                    {participants[p].trend
-                      ? <Chip color={TREND_COLOR[participants[p].trend] || T.muted}>{participants[p].trend}</Chip>
-                      : <span style={{ color: T.muted }}>—</span>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {PARTICIPANT_ORDER.filter((p) => participants[p]).map((p) => {
+            const row = participants[p];
+            const lean = participantLean(row.ratio);
+            const wt = NIFTY_PARTICIPANT_WEIGHT[p];
+            return (
+              <div key={p} style={{
+                display: "grid",
+                gridTemplateColumns: "64px 72px 1fr auto",
+                alignItems: "center", gap: 8,
+                padding: "8px 10px", borderRadius: 8,
+                background: p === "FII" ? `${biasColor}10` : T.panel2,
+                border: `1px solid ${p === "FII" ? biasColor + "44" : T.line}`,
+              }}>
+                <span style={{ fontFamily: DISP, fontSize: 13, fontWeight: 700, color: T.fg }}>{p}</span>
+                <span style={{ fontFamily: MONO, fontSize: 12, fontWeight: 700, color: lean.color }}>{lean.text}</span>
+                <span style={{ fontFamily: MONO, fontSize: 12, color: T.fg }}>
+                  {row.ratio != null ? `${fmtNum(row.ratio, 0)}%` : "—"}
+                  {row.trend ? <span style={{ color: TREND_COLOR[row.trend] || T.muted, marginLeft: 8 }}>{row.trend}</span> : null}
+                </span>
+                <span style={{ fontFamily: MONO, fontSize: 10, color: wt.scores ? T.cyan : T.muted, fontWeight: wt.scores ? 700 : 400 }}>
+                  {wt.scores ? `${wt.pct}%` : wt.label}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
-      <div style={{ height: 10 }} />
-      <Row label="FII cash" value={cash?.fii_buy != null ? `buy ${fmtNum(cash.fii_buy, 0)} / sell ${fmtNum(cash.fii_sell, 0)}` : "unavailable"}
-        color={cash?.fii_buy != null && cash?.fii_sell != null ? directionColor(cash.fii_buy - cash.fii_sell) : undefined} />
-      <Row label="DII cash" value={cash?.dii_buy != null ? `buy ${fmtNum(cash.dii_buy, 0)} / sell ${fmtNum(cash.dii_sell, 0)}` : "unavailable"}
-        color={cash?.dii_buy != null && cash?.dii_sell != null ? directionColor(cash.dii_buy - cash.dii_sell) : undefined} />
+
+      {(fiiCash || diiCash) && (
+        <div style={{ display: "flex", gap: 16, marginTop: 12, flexWrap: "wrap" }}>
+          {fiiCash && (
+            <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>
+              FII cash <span style={{ fontFamily: MONO, fontWeight: 700, color: fiiCash.color }}>{fiiCash.text}</span>
+            </div>
+          )}
+          {diiCash && (
+            <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>
+              DII cash <span style={{ fontFamily: MONO, fontWeight: 700, color: diiCash.color }}>{diiCash.text}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {positioningUpdatedAt && (
+        <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted, marginTop: 10 }}>
+          Updated {positioningUpdatedAt.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST · EOD NSE file
+        </div>
+      )}
     </Panel>
   );
 }
@@ -1660,15 +1975,18 @@ function formButtonStyle(primary, disabled) {
 const tradeThStyle = { padding: "6px 8px", fontWeight: 500, whiteSpace: "nowrap" };
 const tradeTdStyle = { padding: "6px 8px", color: T.fg, whiteSpace: "nowrap" };
 
-// Live mark-to-market for one open trade, from the option-chain lookup
-// built in load() below. Mirrors paper_trading.compute_pnl's sign
-// convention (BUY profits above entry, SELL below) but computed client-side
-// against a *current*, not final, premium -- unrealized, not stored.
-function liveFigures(trade, chainByStrike) {
+// Live mark-to-market for one open trade. `mapsByExpiry` is
+// { [expiry]: { [strike]: row }, _default?: flatMap }. Older trades without
+// an expiry fall back to `_default` (the form's currently selected expiry).
+function liveFigures(trade, mapsByExpiry) {
   const invested = trade.entry_price * trade.lot_size * trade.lots;
   if (trade.status !== "open") {
     return { invested, currentLtp: null, currentValue: null, pnl: trade.pnl, isLive: false };
   }
+  const chainByStrike = (trade.expiry && mapsByExpiry?.[trade.expiry])
+    || mapsByExpiry?._default
+    || mapsByExpiry
+    || {};
   const chainRow = chainByStrike[Number(trade.strike)];
   const currentLtp = chainRow ? (trade.option_type === "CE" ? chainRow.ceLtp : chainRow.peLtp) : null;
   if (currentLtp == null) {
@@ -1701,29 +2019,51 @@ function checkStopTarget(trade, currentLtp) {
 
 // Prefers Upstox (real broker LTPs, connected via /api/upstox/login) for
 // the second-by-second feed; falls back to the NSE-scrape-backed
-// /api/optionchain/today (same one "Fetch live" already used) whenever
-// Upstox isn't connected or errors, so the panel still works before/without
-// ever connecting Upstox. `source` on the result says which one answered.
-async function fetchChain() {
+// /api/optionchain/today whenever Upstox isn't connected or errors.
+// Pass `expiry` (NSE `18-Aug-2026` or ISO `2026-08-18`) to pin a contract week.
+async function fetchChain(expiry) {
+  const expiryQ = expiry ? `&expiry=${encodeURIComponent(expiry)}` : "";
+  let upstoxHint = null;
   try {
-    const res = await fetch(`${PCR_API_BASE}/upstox/optionchain?symbol=NIFTY`);
+    const res = await fetch(`${PCR_API_BASE}/upstox/optionchain?symbol=NIFTY${expiryQ}`);
     if (res.ok) {
       const json = await res.json();
       if (json.connected && (json.rows || []).length > 0) {
-        return { spot: json.spot ?? null, rows: json.rows, source: "upstox" };
+        return {
+          spot: json.spot ?? null, rows: json.rows, source: "upstox",
+          expiry: json.expiry || expiry || null, connected: true, upstoxHint: null,
+        };
+      }
+      if (json.connected === false) {
+        upstoxHint = json.error || "Upstox not connected";
       }
     }
   } catch {
     // fall through to the NSE fallback below
   }
   try {
-    const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
-    if (!res.ok) return { spot: null, rows: [], source: null };
+    const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50${expiryQ}`);
+    if (!res.ok) return { spot: null, rows: [], source: null, expiry: expiry || null, connected: false, upstoxHint };
     const json = await res.json();
-    return { spot: json.spot ?? null, rows: json.rows || [], source: "nse" };
+    return {
+      spot: json.spot ?? null, rows: json.rows || [], source: "nse",
+      expiry: json.expiry || expiry || null, connected: false, upstoxHint,
+    };
   } catch {
-    return { spot: null, rows: [], source: null }; // background tick -- not worth surfacing an error banner for
+    return { spot: null, rows: [], source: null, expiry: expiry || null, connected: false, upstoxHint };
   }
+}
+
+function expiryLabel(exp) {
+  if (!exp) return "—";
+  // Accept ISO or NSE format for display.
+  try {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(exp)) {
+      const d = new Date(exp + "T00:00:00");
+      return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+    }
+  } catch { /* keep raw */ }
+  return exp;
 }
 
 function chainMapFromRows(rows) {
@@ -1758,8 +2098,13 @@ function PaperTradingPanel() {
   const [weekly, setWeekly] = useState([]);
   const [chainRows, setChainRows] = useState([]);
   const [chainSpot, setChainSpot] = useState(null);
-  const [chainByStrike, setChainByStrike] = useState({});
+  // mapsByExpiry: { [expiry]: { [strike]: row }, _default: current form expiry map }
+  const [mapsByExpiry, setMapsByExpiry] = useState({});
   const [chainSource, setChainSource] = useState(null); // "upstox" | "nse" | null
+  const [upstoxConnected, setUpstoxConnected] = useState(null); // null | true | false
+  const [upstoxHint, setUpstoxHint] = useState(null);
+  const [expiries, setExpiries] = useState([]);
+  const [selectedExpiry, setSelectedExpiry] = useState("");
   const chainFetchInFlight = useRef(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
@@ -1767,71 +2112,133 @@ function PaperTradingPanel() {
     strike: "", optionType: "CE", action: "BUY", lots: 1, lotSize: DEFAULT_LOT_SIZE_FALLBACK, entryPrice: "",
     stopLoss: "", targetPrice: "", notes: "",
   });
-  const tradesRef = useRef([]); // mirrors `trades` for the 1s poll effect below, which can't take trades as a dep without recreating the interval on every load()
-  const autoClosingRef = useRef(new Set()); // trade ids currently being auto-closed, so a hit isn't re-submitted on the next tick before the server confirms
+  const tradesRef = useRef([]);
+  const selectedExpiryRef = useRef("");
+  const autoClosingRef = useRef(new Set());
   const [fetchingLtp, setFetchingLtp] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [closingDrafts, setClosingDrafts] = useState({});
 
+  const refreshUpstoxStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${PCR_API_BASE}/upstox/status`);
+      if (!res.ok) { setUpstoxConnected(false); return; }
+      const json = await res.json();
+      setUpstoxConnected(Boolean(json.connected));
+    } catch {
+      setUpstoxConnected(false);
+    }
+  }, []);
+
+  const loadExpiries = useCallback(async () => {
+    try {
+      const res = await fetch(`${PCR_API_BASE}/expiries?symbol=NIFTY`);
+      if (!res.ok) return;
+      const json = await res.json();
+      const list = json.expiries || [];
+      setExpiries(list);
+      setSelectedExpiry((prev) => (prev && list.includes(prev) ? prev : list[0] || ""));
+    } catch {
+      /* nice-to-have; chain still loads with backend default */
+    }
+  }, []);
+
+  // Fetch one or more expiries and rebuild mapsByExpiry. Always refreshes
+  // the form's selected expiry (for the clickable chain table) plus any
+  // distinct expiries on open trades so multi-week journals mark correctly.
+  const refreshChains = useCallback(async (formExpiry, openList) => {
+    const needed = [];
+    const seen = new Set();
+    const push = (exp) => {
+      const key = exp || "";
+      if (seen.has(key)) return;
+      seen.add(key);
+      needed.push(exp || null);
+    };
+    push(formExpiry || null);
+    (openList || []).forEach((t) => {
+      if (t.status === "open" && t.expiry) push(t.expiry);
+    });
+
+    const results = await Promise.all(needed.map((exp) => fetchChain(exp || undefined)));
+    const maps = {};
+    let formChain = results[0] || { rows: [], spot: null, source: null, upstoxHint: null, connected: false };
+
+    results.forEach((chain, i) => {
+      const requested = needed[i];
+      const map = chainMapFromRows(chain.rows || []);
+      if (requested) maps[requested] = map;
+      if (chain.expiry && chain.expiry !== requested) maps[chain.expiry] = map;
+      if (i === 0) formChain = chain;
+    });
+    maps._default = chainMapFromRows(formChain.rows || []);
+
+    setChainRows(formChain.rows || []);
+    setChainSpot(formChain.spot ?? null);
+    setChainSource(formChain.source);
+    setMapsByExpiry(maps);
+    if (formChain.upstoxHint) setUpstoxHint(formChain.upstoxHint);
+    else if (formChain.source === "upstox") setUpstoxHint(null);
+    if (formChain.source === "upstox") setUpstoxConnected(true);
+    else if (formChain.connected === false) setUpstoxConnected(false);
+    return { formChain, maps };
+  }, []);
+
   const load = useCallback(async () => {
     try {
-      const [json, chain] = await Promise.all([getJSON("/paper-trades?days=90"), fetchChain()]);
-      setTrades(json.trades || []);
+      const json = await getJSON("/paper-trades?days=90");
+      const list = json.trades || [];
+      setTrades(list);
       setSummary(json.summary || null);
       setWeekly(json.weekly || []);
-      setChainRows(chain.rows);
-      setChainSpot(chain.spot);
-      setChainByStrike(chainMapFromRows(chain.rows));
-      setChainSource(chain.source);
+      await refreshChains(selectedExpiryRef.current, list);
       setErr("");
     } catch (e) {
       setErr(e.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [refreshChains]);
 
+  useEffect(() => { loadExpiries(); refreshUpstoxStatus(); }, [loadExpiries, refreshUpstoxStatus]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => { tradesRef.current = trades; }, [trades]);
+  useEffect(() => { selectedExpiryRef.current = selectedExpiry; }, [selectedExpiry]);
+
+  // When the user picks a different expiry, reload that chain for the table
+  // (and keep open-trade maps). Don't re-fetch the whole trades list.
+  useEffect(() => {
+    if (!selectedExpiry && expiries.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      if (chainFetchInFlight.current) return;
+      chainFetchInFlight.current = true;
+      try {
+        if (!cancelled) await refreshChains(selectedExpiry, tradesRef.current);
+      } finally {
+        chainFetchInFlight.current = false;
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedExpiry, refreshChains, expiries.length]);
 
   const openTrades = trades.filter((t) => t.status === "open");
 
-  // Live option chain + PnL + stop-loss/target auto-execution, broker-
-  // platform-style: re-pull just the chain (not the whole trades list)
-  // every 1s. Upstox (when connected) genuinely updates that fast; the NSE
-  // fallback is itself CDN-cached on ~10-15s cycles upstream (see
-  // backend.py) so it'll often just re-serve the same numbers between
-  // ticks -- harmless, not worth a separate slower interval for the
-  // fallback case. The in-flight guard skips a tick if the previous fetch
-  // hasn't finished yet, so a slow response can't pile up requests.
-  //
-  // Auto-execution only fires while this panel is mounted and polling --
-  // there's no server-side scheduler in this serverless deployment to
-  // watch prices when the page isn't open, so a stop-loss/target set here
-  // is a live watch, not a standing broker-side order. autoClosingRef
-  // guards against re-submitting the same hit on the next tick before the
-  // server confirms the close and a fresh load() marks the trade closed.
   useEffect(() => {
     const id = setInterval(async () => {
       if (chainFetchInFlight.current) return;
       chainFetchInFlight.current = true;
       try {
-        const chain = await fetchChain();
-        const freshMap = chainMapFromRows(chain.rows);
-        setChainRows(chain.rows);
-        setChainSpot(chain.spot);
-        setChainByStrike(freshMap);
-        setChainSource(chain.source);
+        const { maps } = await refreshChains(selectedExpiryRef.current, tradesRef.current);
 
         for (const t of tradesRef.current) {
           if (t.status !== "open" || autoClosingRef.current.has(t.id)) continue;
-          const row = freshMap[Number(t.strike)];
-          const ltp = row ? (t.option_type === "CE" ? row.ceLtp : row.peLtp) : null;
-          const reason = checkStopTarget(t, ltp);
+          const { currentLtp } = liveFigures(t, maps);
+          const reason = checkStopTarget(t, currentLtp);
           if (!reason) continue;
           autoClosingRef.current.add(t.id);
           try {
-            await postJSON(`/paper-trades/${t.id}/close`, { exit_price: ltp, reason });
+            await postJSON(`/paper-trades/${t.id}/close`, { exit_price: currentLtp, reason });
             await load();
           } finally {
             autoClosingRef.current.delete(t.id);
@@ -1842,19 +2249,19 @@ function PaperTradingPanel() {
       }
     }, 1000);
     return () => clearInterval(id);
-  }, [load]);
+  }, [load, refreshChains]);
 
   const selectStrike = (strike, optionType, ltp) => {
     setForm((f) => ({ ...f, strike: String(strike), optionType, entryPrice: ltp != null ? String(ltp) : f.entryPrice }));
   };
 
   const unrealizedTotal = openTrades.reduce((sum, t) => {
-    const { pnl, isLive } = liveFigures(t, chainByStrike);
+    const { pnl, isLive } = liveFigures(t, mapsByExpiry);
     return isLive ? sum + pnl : sum;
   }, 0);
-  const investedTotal = openTrades.reduce((sum, t) => sum + liveFigures(t, chainByStrike).invested, 0);
+  const investedTotal = openTrades.reduce((sum, t) => sum + liveFigures(t, mapsByExpiry).invested, 0);
   const currentValueTotal = openTrades.reduce((sum, t) => {
-    const { currentValue, isLive } = liveFigures(t, chainByStrike);
+    const { currentValue, isLive } = liveFigures(t, mapsByExpiry);
     return isLive ? sum + currentValue : sum;
   }, 0);
 
@@ -1862,12 +2269,10 @@ function PaperTradingPanel() {
     if (!form.strike) return;
     setFetchingLtp(true);
     try {
-      const res = await fetch(`${PCR_API_BASE}/optionchain/today?symbol=NIFTY&n=50`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      const row = (json.rows || []).find((r) => Number(r.strike) === Number(form.strike));
+      const chain = await fetchChain(selectedExpiry || undefined);
+      const row = (chain.rows || []).find((r) => Number(r.strike) === Number(form.strike));
       if (!row) {
-        setErr(`No live data for strike ${form.strike} — try a strike closer to spot, or type the premium in manually.`);
+        setErr(`No live data for strike ${form.strike}${selectedExpiry ? ` on ${expiryLabel(selectedExpiry)}` : ""} — try a strike closer to spot, or type the premium in manually.`);
         return;
       }
       const ltp = form.optionType === "CE" ? row.ceLtp : row.peLtp;
@@ -1876,6 +2281,8 @@ function PaperTradingPanel() {
         return;
       }
       setForm((f) => ({ ...f, entryPrice: String(ltp) }));
+      setChainSource(chain.source);
+      if (chain.source === "upstox") setUpstoxConnected(true);
       setErr("");
     } catch (e) {
       setErr(`Couldn't fetch live premium: ${e.message}`);
@@ -1902,6 +2309,7 @@ function PaperTradingPanel() {
         stop_loss: form.stopLoss ? Number(form.stopLoss) : null,
         target_price: form.targetPrice ? Number(form.targetPrice) : null,
         notes: form.notes || null,
+        expiry: selectedExpiry || null,
       });
       setForm((f) => ({ ...f, strike: "", entryPrice: "", stopLoss: "", targetPrice: "", notes: "" }));
       setErr("");
@@ -1930,11 +2338,13 @@ function PaperTradingPanel() {
     }
   };
 
+  const connectUpstoxHref = `${PCR_API_BASE}/upstox/login`;
+
   return (
     <Panel
       title="Paper trading journal"
       right={summary && (
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <Chip color={T.muted}>{summary.open_count} open</Chip>
           {openTrades.length > 0 && (
             <>
@@ -1947,10 +2357,52 @@ function PaperTradingPanel() {
             <Chip color={summary.win_rate_pct >= 50 ? T.put : T.call}>Win rate: {summary.win_rate_pct}%</Chip>
           )}
           <Chip color={directionColor(summary.total_pnl)}>Realized PnL: {fmtSigned(summary.total_pnl, 0)}</Chip>
+          {upstoxConnected ? (
+            <Chip color={T.cyan} title="Live premiums via your connected Upstox session">Upstox linked</Chip>
+          ) : (
+            <a
+              href={connectUpstoxHref}
+              target="_blank"
+              rel="noreferrer"
+              style={{ textDecoration: "none" }}
+              title="Open Upstox OAuth — after login, live LTPs use your broker feed"
+            >
+              <Chip color={T.amber}>Connect Upstox</Chip>
+            </a>
+          )}
         </div>
       )}
     >
+      {!upstoxConnected && upstoxConnected !== null && (
+        <div style={{
+          marginBottom: 12, padding: "8px 12px", background: `${T.amber}14`,
+          border: `1px solid ${T.amber}55`, borderRadius: 8, color: T.fg, fontSize: 12,
+          display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center",
+        }}>
+          <span>
+            {upstoxHint || "Upstox not linked — paper journal is using the NSE-derived feed. Connect for broker LTPs."}
+          </span>
+          <a href={connectUpstoxHref} target="_blank" rel="noreferrer" style={{ color: T.cyan, fontWeight: 600 }}>
+            Link Upstox →
+          </a>
+        </div>
+      )}
+
       <form onSubmit={submitTrade} style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "flex-end", marginBottom: 16 }}>
+        <div style={{ width: 130 }}>
+          <label style={formLabelStyle}>Expiry</label>
+          <select
+            value={selectedExpiry}
+            onChange={(e) => setSelectedExpiry(e.target.value)}
+            style={formInputStyle}
+            title="Which weekly/monthly contract this paper trade is on"
+          >
+            {expiries.length === 0 && <option value="">Nearest</option>}
+            {expiries.map((exp) => (
+              <option key={exp} value={exp}>{expiryLabel(exp)}</option>
+            ))}
+          </select>
+        </div>
         <div style={{ width: 100 }}>
           <label style={formLabelStyle}>Strike</label>
           <input type="number" value={form.strike} placeholder="24500"
@@ -2011,6 +2463,9 @@ function PaperTradingPanel() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6, flexWrap: "wrap", gap: 6 }}>
             <div style={{ fontFamily: DISP, fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: 0.6 }}>
               Live NIFTY option chain
+              {selectedExpiry && (
+                <span style={{ color: T.fg, textTransform: "none", fontWeight: 400 }}> · {expiryLabel(selectedExpiry)}</span>
+              )}
               {chainSpot != null && (
                 <span style={{ color: T.fg, textTransform: "none", fontWeight: 400 }}> · spot {fmtNum(chainSpot, 1)}</span>
               )}
@@ -2022,7 +2477,7 @@ function PaperTradingPanel() {
                   }}
                   title={chainSource === "upstox"
                     ? "Live via your connected Upstox account (1s refresh)"
-                    : "Upstox not connected — falling back to the NSE-derived feed. Visit /api/upstox/login to connect Upstox."}
+                    : "Upstox not connected — falling back to the NSE-derived feed. Use Connect Upstox above."}
                 >
                   via {chainSource === "upstox" ? "Upstox" : "NSE fallback"}
                 </span>
@@ -2088,6 +2543,7 @@ function PaperTradingPanel() {
             <thead>
               <tr style={{ color: T.muted, textAlign: "left" }}>
                 <th style={tradeThStyle}>Entry time</th>
+                <th style={tradeThStyle}>Expiry</th>
                 <th style={tradeThStyle}>Strike</th>
                 <th style={tradeThStyle}>Type</th>
                 <th style={tradeThStyle}>Action</th>
@@ -2105,7 +2561,7 @@ function PaperTradingPanel() {
             </thead>
             <tbody>
               {trades.map((t) => {
-                const { invested, currentLtp, currentValue, pnl, isLive } = liveFigures(t, chainByStrike);
+                const { invested, currentLtp, currentValue, pnl, isLive } = liveFigures(t, mapsByExpiry);
                 const isOpen = t.status === "open";
                 return (
                   <tr key={t.id} style={{ borderTop: `1px solid ${T.line}` }}>
@@ -2116,6 +2572,7 @@ function PaperTradingPanel() {
                       </div>
                       {isOpen && <LiveElapsed since={t.entry_time} />}
                     </td>
+                    <td style={tradeTdStyle}>{expiryLabel(t.expiry)}</td>
                     <td style={tradeTdStyle}>{fmtNum(t.strike, 0)}</td>
                     <td style={tradeTdStyle}>{t.option_type}</td>
                     <td style={tradeTdStyle}>{t.action}</td>
@@ -2198,12 +2655,10 @@ function PaperTradingPanel() {
 
       <div style={{ height: 8 }} />
       <EmptyNote>
-        Simulated trades only — nothing here places a real order. Entry/exit premiums are either typed in or pulled
-        from the live option chain above (Upstox when connected, otherwise the PCR tracker's NSE-derived feed); lot
-        size defaults to a guess and should be confirmed against NSE's current contract spec before trusting PnL
-        figures. Live premiums refresh every 1s. Stop-loss/target are watched client-side against that same feed and
-        auto-close the trade on a hit — this only happens while this page is open and polling; it is not a standing
-        order placed anywhere, so a level set here won't fire if you close the tab.
+        Simulated trades only — nothing here places a real order. Pick an expiry, then entry/exit premiums come from
+        the live option chain (Upstox when linked, otherwise NSE fallback). Lot size defaults to a guess — confirm
+        against NSE before trusting PnL. Live premiums refresh every 1s. Stop-loss/target only fire while this page
+        is open and polling.
       </EmptyNote>
     </Panel>
   );
@@ -2461,6 +2916,12 @@ function HistoryTable({ history }) {
 }
 
 /* ---------- app ---------- */
+const GIFT_POLL_MS = 30_000; // scrape cadence — don't hammer niftytrader.in
+// NSE participant OI is end-of-day; poll slower than GIFT but often enough
+// to pick up a newly published CSV / cash report without hammering NSE.
+const POSITIONING_POLL_MS = 5 * 60_000;
+const SCORE_POLL_MS = 60_000; // live open-bias score refresh
+
 export default function App() {
   const [brief, setBrief] = useState(null);
   const [history, setHistory] = useState(null);
@@ -2470,6 +2931,14 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [liveGift, setLiveGift] = useState(null);
+  const [giftUpdatedAt, setGiftUpdatedAt] = useState(null);
+  const [giftRefreshing, setGiftRefreshing] = useState(false);
+  const [livePositioning, setLivePositioning] = useState(null);
+  const [positioningUpdatedAt, setPositioningUpdatedAt] = useState(null);
+  const [positioningRefreshing, setPositioningRefreshing] = useState(false);
+  const [liveScore, setLiveScore] = useState(null);
+  const [scoreUpdatedAt, setScoreUpdatedAt] = useState(null);
 
   const loadBrief = useCallback(async () => {
     try {
@@ -2492,32 +2961,138 @@ export default function App() {
     }
   }, []);
 
+  const loadGift = useCallback(async () => {
+    setGiftRefreshing(true);
+    try {
+      const json = await getJSON("/gift");
+      setLiveGift(json);
+      setGiftUpdatedAt(new Date());
+    } catch (e) {
+      console.warn("GIFT live refresh failed:", e.message);
+    } finally {
+      setGiftRefreshing(false);
+    }
+  }, []);
+
+  const loadPositioning = useCallback(async () => {
+    setPositioningRefreshing(true);
+    try {
+      const json = await getJSON("/positioning/live");
+      setLivePositioning(json);
+      setPositioningUpdatedAt(new Date());
+      if (json.fii_rows && json.fii_rows.length) setFiiRows(json.fii_rows);
+    } catch (e) {
+      console.warn("NSE positioning refresh failed:", e.message);
+    } finally {
+      setPositioningRefreshing(false);
+    }
+  }, []);
+
+  const loadLiveScore = useCallback(async () => {
+    try {
+      const json = await getJSON("/score/live");
+      setLiveScore(json);
+      setScoreUpdatedAt(new Date());
+      // Keep GIFT panel in sync when the minute score refresh includes a fresher quote.
+      if (json.gift?.available) {
+        setLiveGift(json.gift);
+        setGiftUpdatedAt(new Date());
+      }
+    } catch (e) {
+      console.warn("Live score refresh failed:", e.message);
+    }
+  }, []);
+
   useEffect(() => {
     (async () => {
       setLoading(true);
-      await Promise.all([loadBrief(), loadHistoryAndTrend()]);
+      await Promise.all([loadBrief(), loadHistoryAndTrend(), loadGift(), loadPositioning(), loadLiveScore()]);
       setLoading(false);
     })();
-  }, [loadBrief, loadHistoryAndTrend]);
+  }, [loadBrief, loadHistoryAndTrend, loadGift, loadPositioning, loadLiveScore]);
 
-  // No auto-refresh (explicitly turned off) — data updates only on load or
-  // via the manual refresh button on the verdict card.
+  useEffect(() => {
+    let timer = null;
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      loadGift();
+    };
+    timer = setInterval(tick, GIFT_POLL_MS);
+    const onVis = () => {
+      if (document.visibilityState === "visible") loadGift();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [loadGift]);
+
+  useEffect(() => {
+    let timer = null;
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      loadPositioning();
+    };
+    timer = setInterval(tick, POSITIONING_POLL_MS);
+    const onVis = () => {
+      if (document.visibilityState === "visible") loadPositioning();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [loadPositioning]);
+
+  useEffect(() => {
+    let timer = null;
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      loadLiveScore();
+    };
+    timer = setInterval(tick, SCORE_POLL_MS);
+    const onVis = () => {
+      if (document.visibilityState === "visible") loadLiveScore();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [loadLiveScore]);
+
   const refreshAll = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([loadBrief(), loadHistoryAndTrend()]);
+    await Promise.all([loadBrief(), loadHistoryAndTrend(), loadGift(), loadPositioning(), loadLiveScore()]);
     setRefreshing(false);
-  }, [loadBrief, loadHistoryAndTrend]);
+  }, [loadBrief, loadHistoryAndTrend, loadGift, loadPositioning, loadLiveScore]);
 
   return (
     <div style={{ minHeight: "100%", background: T.ink, fontFamily: DISP }}>
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "24px 16px 48px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
           <div style={{ fontSize: 20, fontWeight: 700, color: T.fg }}>Nifty Pre-Market Brief</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             {loading && <span style={{ fontSize: 12, color: T.muted }}>Loading…</span>}
+            {scoreUpdatedAt && (
+              <span style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>
+                Score {scoreUpdatedAt.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit" })} IST
+              </span>
+            )}
+            {giftUpdatedAt && (
+              <span style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>
+                GIFT {giftUpdatedAt.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit" })} IST
+              </span>
+            )}
+            {positioningUpdatedAt && (
+              <span style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>
+                NSE OI {positioningUpdatedAt.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST
+              </span>
+            )}
             {lastUpdated && (
               <span style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>
-                Updated {lastUpdated.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST
+                Brief {lastUpdated.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST
               </span>
             )}
             <a href="./index.html"
@@ -2535,13 +3110,20 @@ export default function App() {
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
           <VerdictCard
-            brief={brief} showHistory={showHistory} onToggleHistory={() => setShowHistory((s) => !s)}
+            brief={brief} liveGift={liveGift} liveScore={liveScore}
+            showHistory={showHistory} onToggleHistory={() => setShowHistory((s) => !s)}
             onRefresh={refreshAll} refreshing={refreshing}
           />
-          <LiveCuesPanel brief={brief} />
-          <MacroPanel brief={brief} />
-          <PositioningPanel brief={brief} fiiRows={fiiRows} />
-          <ParticipantPanel brief={brief} />
+          <LiveCuesPanel
+            brief={brief} liveGift={liveGift} liveScore={liveScore}
+            giftUpdatedAt={giftUpdatedAt} giftRefreshing={giftRefreshing}
+          />
+          <MacroPanel brief={brief} liveScore={liveScore} />
+          <PositioningPanel brief={brief} fiiRows={fiiRows} livePositioning={livePositioning} />
+          <ParticipantPanel
+            brief={brief} livePositioning={livePositioning} liveScore={liveScore}
+            positioningUpdatedAt={positioningUpdatedAt} positioningRefreshing={positioningRefreshing}
+          />
           <EventsNewsPanel brief={brief} />
           <LevelsPanel brief={brief} />
           <MoversPanel />

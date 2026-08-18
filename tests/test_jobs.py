@@ -204,3 +204,50 @@ def test_run_morning_job_degrades_gracefully_when_everything_is_unavailable(monk
     assert result["components"]["fii_dii_cash"] is None
     assert result["disclaimer"] == jobs.scoring.DISCLAIMER
     assert result["telegram_sent"] is False
+
+
+def test_compute_live_score_recomputes_without_persisting(monkeypatch):
+    async def fake_get_brief_history(days=1):
+        return [{
+            "trade_date": "2026-08-18",
+            "score": 10.0,
+            "verdict": "Flat open",
+            "expected_low": 24000,
+            "expected_high": 24500,
+            "components": {
+                "previous_close": 24366.0,
+                "is_event_day": False,
+                "participants": {"FII": {"ratio": 40.0}},
+                "levels": {"pdh": 24500, "pdl": 24200},
+            },
+        }]
+
+    async def fake_fetch_gift(client):
+        return {"price": 24178.5, "change": -0.5}
+
+    async def fake_fetch_quote(client, symbol):
+        return {"price": 100.0, "previous_close": 99.0, "pct_change": 1.0}
+
+    async def fake_fii(days=5):
+        return {"ratio": 40.0, "trend": "falling"}
+
+    saved = {"called": False}
+
+    async def fake_save_morning_brief(brief):
+        saved["called"] = True
+
+    monkeypatch.setattr(jobs.storage, "get_brief_history", fake_get_brief_history)
+    monkeypatch.setattr(jobs.market_data, "fetch_gift_nifty", fake_fetch_gift)
+    monkeypatch.setattr(jobs.market_data, "fetch_quote", fake_fetch_quote)
+    monkeypatch.setattr(jobs.positioning, "compute_fii_positioning", fake_fii)
+    monkeypatch.setattr(jobs.storage, "save_morning_brief", fake_save_morning_brief)
+
+    result = asyncio.run(jobs.compute_live_score())
+    assert result["live"] is True
+    assert result["score"] is not None
+    assert result["verdict"] in ("Gap-up likely", "Flat open", "Gap-down likely")
+    assert result["gift"]["price"] == 24178.5
+    assert result["brief_score"] == 10.0
+    assert result["outlook"]["headline"]
+    assert saved["called"] is False  # must not overwrite the morning brief
+

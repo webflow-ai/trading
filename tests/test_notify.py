@@ -65,6 +65,27 @@ def test_format_brief_message_uses_news_sentiment_when_present():
     assert "News sentiment: Mildly bullish on strong US tech earnings" in message
 
 
+def test_format_brief_message_prefers_outlook_over_top_signals():
+    outlook = scoring.build_tomorrow_outlook(_brief(
+        predicted_open=24650,
+        news_sentiment="Mildly constructive",
+        components={
+            "gift": {"score": 0.8, "gap_pct": 0.35, "fair_value": 24685.0, "price": 24720.0},
+            "us_asia": {"score": 0.3, "us_avg_pct": 0.4, "asia_avg_pct": 0.2},
+            "macro": {"score": -0.2, "flags": {"crude": -0.1}},
+            "fii": {"score": 0.5, "ratio": 58.0, "trend": "rising"},
+            "confidence": "high",
+            "previous_close": 24580.0,
+            "levels": {"pdh": 24720.0, "pdl": 24480.0},
+        },
+    ))
+    message = notify.format_brief_message(_brief(outlook=outlook, predicted_open=24650))
+    assert "gap-up" in message.lower() or "Gap-up" in message
+    assert "Why:" in message
+    assert "First hour:" in message
+    assert "Top signals:" not in message
+
+
 def test_send_brief_skips_when_not_configured(monkeypatch):
     monkeypatch.setattr(notify, "TELEGRAM_BOT_TOKEN", None)
     monkeypatch.setattr(notify, "TELEGRAM_CHAT_ID", None)

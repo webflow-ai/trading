@@ -77,6 +77,86 @@ def test_brief_today_returns_latest_row(monkeypatch):
     assert r.json()["verdict"] == "Gap-up likely"
 
 
+def test_gift_live_returns_price_gap_and_predicted_open(monkeypatch):
+    async def fake_fetch_gift_nifty(client=None):
+        return {"price": 24700.0, "change": -12.5}
+
+    async def fake_get_brief_history(days=1):
+        return [{"trade_date": "2026-08-10", "components": {"previous_close": 24600.0}}]
+
+    monkeypatch.setattr(main_module.market_data, "fetch_gift_nifty", fake_fetch_gift_nifty)
+    monkeypatch.setattr(main_module.storage, "get_brief_history", fake_get_brief_history)
+
+    r = client.get("/api/premarket/gift")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is True
+    assert body["price"] == 24700.0
+    assert body["change"] == -12.5
+    assert body["fair_value"] == 24635.0  # 24600 + 35
+    assert body["predicted_open"] == 24665.0  # 24700 - 35
+    assert body["gap_pct"] is not None
+    assert body["fetched_at"]
+
+
+def test_gift_live_marks_unavailable_when_scrape_fails(monkeypatch):
+    async def fake_fetch_gift_nifty(client=None):
+        return None
+
+    async def fake_get_brief_history(days=1):
+        return []
+
+    monkeypatch.setattr(main_module.market_data, "fetch_gift_nifty", fake_fetch_gift_nifty)
+    monkeypatch.setattr(main_module.storage, "get_brief_history", fake_get_brief_history)
+
+    r = client.get("/api/premarket/gift")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is False
+    assert body["price"] is None
+    assert body["predicted_open"] is None
+
+
+def test_positioning_live_endpoint_returns_outlook(monkeypatch):
+    async def fake_refresh(persist=True):
+        return {
+            "available": True,
+            "from_nse": True,
+            "trade_date": "2026-08-10",
+            "participants": {"FII": {"ratio": 55.0, "trend": "rising"}},
+            "outlook": {"headline": "FII futures are net long", "bias": "bullish", "why": [], "watch": []},
+            "fetched_at": "2026-08-18T21:00:00+05:30",
+        }
+
+    monkeypatch.setattr(main_module.positioning, "refresh_positioning_from_nse", fake_refresh)
+    r = client.get("/api/premarket/positioning/live")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["from_nse"] is True
+    assert body["outlook"]["bias"] == "bullish"
+
+
+def test_score_live_endpoint_returns_live_score(monkeypatch):
+    async def fake_compute_live_score():
+        return {
+            "live": True,
+            "score": -55.0,
+            "verdict": "Gap-down likely",
+            "confidence": "high",
+            "predicted_open": 24140.0,
+            "gift": {"available": True, "price": 24175.0, "change": -1.0},
+            "fetched_at": "2026-08-18T21:00:00+05:30",
+        }
+
+    monkeypatch.setattr(main_module.jobs, "compute_live_score", fake_compute_live_score)
+    r = client.get("/api/premarket/score/live")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["live"] is True
+    assert body["score"] == -55.0
+    assert body["verdict"] == "Gap-down likely"
+
+
 def test_classify_direction_dead_zone_and_signs():
     assert main_module._classify_direction(100.0, 100.05) == "flat"  # +0.05%, within the dead zone
     assert main_module._classify_direction(100.0, 100.5) == "up"
@@ -229,6 +309,23 @@ def test_create_paper_trade_endpoint_passes_through_stop_loss_and_target(monkeyp
     assert r.status_code == 200
     assert captured["stop_loss"] == 90.0
     assert captured["target_price"] == 160.0
+
+
+def test_create_paper_trade_endpoint_passes_through_expiry(monkeypatch):
+    captured = {}
+
+    async def fake_open_trade(**kwargs):
+        captured.update(kwargs)
+        return {"id": 1, "status": "open", **kwargs}
+
+    monkeypatch.setattr(main_module.paper_trading, "open_trade", fake_open_trade)
+
+    r = client.post("/api/premarket/paper-trades", json={
+        "strike": 24500, "option_type": "CE", "action": "BUY", "entry_price": 120.5,
+        "expiry": "18-Aug-2026",
+    })
+    assert r.status_code == 200
+    assert captured["expiry"] == "18-Aug-2026"
 
 
 def test_close_paper_trade_endpoint_success(monkeypatch):

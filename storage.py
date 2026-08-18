@@ -145,9 +145,19 @@ async def save_macro_snapshots(session: str, quotes: dict, captured_at: dt.datet
 
 async def save_morning_brief(brief: dict) -> None:
     """brief: {trade_date, score, verdict, expected_low, expected_high,
-    components, headlines} — one row per trading day, upserted so a manual
-    re-run of the morning job overwrites rather than duplicates."""
-    await _upsert("morning_briefs", brief, on_conflict="trade_date")
+    predicted_open, components, headlines, news_sentiment} — one row per
+    trading day, upserted so a manual re-run of the morning job overwrites
+    rather than duplicates.
+
+    Extra response-only keys (e.g. top-level `outlook`, `disclaimer`) are
+    stripped before the write — the plain-language outlook lives inside
+    `components` jsonb so older schemas don't need a migration.
+    """
+    row = {k: brief[k] for k in (
+        "trade_date", "score", "verdict", "expected_low", "expected_high",
+        "predicted_open", "components", "headlines", "news_sentiment",
+    ) if k in brief}
+    await _upsert("morning_briefs", row, on_conflict="trade_date")
 
 
 async def get_brief_history(days: int = 30) -> list[dict]:

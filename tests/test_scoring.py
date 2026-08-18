@@ -183,3 +183,73 @@ def test_predicted_open_score_anchored_negative_score_moves_down():
 def test_predicted_open_none_when_nothing_available():
     assert scoring.compute_predicted_open(previous_close=None, gift_price=None, score=None) is None
     assert scoring.compute_predicted_open(previous_close=None, gift_price=None, score=10.0) is None
+
+
+# ---------------- tomorrow outlook (plain-language open scenario) ----------------
+
+def _sample_brief(**overrides) -> dict:
+    base = {
+        "score": 42.0,
+        "verdict": "Gap-up likely",
+        "predicted_open": 24650.0,
+        "expected_low": 24500.0,
+        "expected_high": 24800.0,
+        "news_sentiment": "Mildly constructive overnight cues",
+        "components": {
+            "confidence": "high",
+            "previous_close": 24580.0,
+            "gift": {"score": 0.8, "gap_pct": 0.35, "fair_value": 24615.0, "price": 24700.0},
+            "us_asia": {"score": 0.3, "us_avg_pct": 0.4, "asia_avg_pct": 0.2},
+            "macro": {"score": -0.1, "flags": {"crude": -0.2}},
+            "fii": {"score": 0.4, "ratio": 56.0, "trend": "rising"},
+            "participants": {
+                "Client": {"ratio": 42.0},
+                "FII": {"ratio": 56.0},
+            },
+            "levels": {"pdh": 24720.0, "pdl": 24480.0},
+            "structure": {"bias": "bullish"},
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def test_outlook_gap_up_has_clear_open_expectation_and_first_hour_plan():
+    outlook = scoring.build_tomorrow_outlook(_sample_brief())
+    assert "gap-up" in outlook["headline"].lower()
+    assert "above prior close" in outlook["open_expectation"]
+    assert "~24,650" in outlook["open_expectation"] or "24650" in outlook["open_expectation"].replace(",", "")
+    assert len(outlook["why"]) >= 3
+    assert any("GIFT" in w for w in outlook["why"])
+    assert any("FII" in w for w in outlook["why"])
+    assert any("Predicted open" in k for k in outlook["key_levels"])
+    assert len(outlook["first_hour_plan"]) == 2
+    assert "Open + first hour" in outlook["scope"]
+    assert outlook["disclaimer"] == scoring.DISCLAIMER
+
+
+def test_outlook_gap_down_and_flat_wording():
+    down = scoring.build_tomorrow_outlook(_sample_brief(score=-40.0, verdict="Gap-down likely"))
+    assert "gap-down" in down["headline"].lower()
+    assert "below prior close" in down["open_expectation"]
+
+    flat = scoring.build_tomorrow_outlook(_sample_brief(score=5.0, verdict="Flat open"))
+    assert "flat" in flat["headline"].lower()
+    assert "near prior close" in flat["open_expectation"]
+    assert any("9:15" in p for p in flat["first_hour_plan"])
+
+
+def test_outlook_tolerates_empty_brief():
+    outlook = scoring.build_tomorrow_outlook({"score": 0, "verdict": "Flat open", "components": {}})
+    assert "flat" in outlook["headline"].lower()
+    assert outlook["why"] == []
+    assert "low" in outlook["confidence_note"].lower() or "medium" in outlook["confidence_note"].lower()
+
+
+def test_outlook_flags_event_day_in_confidence_note():
+    outlook = scoring.build_tomorrow_outlook(_sample_brief(components={
+        **_sample_brief()["components"],
+        "confidence": "low",
+        "is_event_day": True,
+    }))
+    assert "Event" in outlook["confidence_note"] or "event" in outlook["confidence_note"]

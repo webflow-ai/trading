@@ -91,6 +91,23 @@ def test_open_trade_carries_stop_loss_and_target_price(monkeypatch):
     assert captured["target_price"] == 160.0
 
 
+def test_open_trade_carries_expiry(monkeypatch):
+    captured = {}
+
+    async def fake_create_paper_trade(row):
+        captured.update(row)
+        return row
+
+    monkeypatch.setattr(paper_trading.storage, "create_paper_trade", fake_create_paper_trade)
+
+    asyncio.run(paper_trading.open_trade(
+        strike=24500, option_type="CE", action="BUY", entry_price=120.5,
+        expiry="18-Aug-2026",
+    ))
+
+    assert captured["expiry"] == "18-Aug-2026"
+
+
 def test_close_trade_computes_pnl_and_patches(monkeypatch):
     async def fake_get_paper_trade(trade_id):
         assert trade_id == 7

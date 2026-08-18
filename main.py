@@ -36,6 +36,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import jobs
 import market_data
 import paper_trading
+import positioning
+import scoring
 import storage
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -72,7 +74,85 @@ async def brief_today():
     rows = await storage.get_brief_history(days=1)
     if not rows:
         return {"trade_date": None, "score": None, "verdict": None, "note": "no brief generated yet"}
-    return rows[0]
+    row = dict(rows[0])
+    components = row.get("components") or {}
+    # Prefer the outlook persisted inside components; rebuild for older
+    # briefs that predate scoring.build_tomorrow_outlook so the dashboard
+    # always gets a plain-language open scenario.
+    outlook = components.get("outlook") or scoring.build_tomorrow_outlook(row)
+    row["outlook"] = outlook
+    row.setdefault("disclaimer", scoring.DISCLAIMER)
+    return row
+
+
+@app.get("/api/premarket/gift")
+async def gift_live():
+    """Fresh GIFT Nifty scrape for the dashboard — independent of the
+    morning brief snapshot so the Live cues panel can poll without
+    re-running the whole scoring job. Gap / predicted open use the latest
+    brief's previous_close when available; otherwise only raw price/change
+    are returned.
+    """
+    now = dt.datetime.now(IST)
+    gift = await market_data.fetch_gift_nifty()
+    previous_close = None
+    try:
+        rows = await storage.get_brief_history(days=1)
+        if rows:
+            previous_close = (rows[0].get("components") or {}).get("previous_close")
+    except Exception as e:
+        print(f"main: gift_live could not read previous_close from brief: {e}")
+
+    if not gift or gift.get("price") is None:
+        return {
+            "available": False,
+            "price": None,
+            "change": None,
+            "previous_close": previous_close,
+            "fair_value": None,
+            "gap_pct": None,
+            "predicted_open": None,
+            "fetched_at": now.isoformat(),
+        }
+
+    price = float(gift["price"])
+    change = gift.get("change")
+    fair_value = None
+    gap_pct = None
+    if previous_close is not None:
+        fair_value = float(previous_close) + scoring.GIFT_FAIR_VALUE_PREMIUM
+        if fair_value:
+            gap_pct = round((price - fair_value) / fair_value * 100, 4)
+    predicted = scoring.compute_predicted_open(
+        previous_close=previous_close, gift_price=price, score=None,
+    )
+    return {
+        "available": True,
+        "price": price,
+        "change": float(change) if change is not None else None,
+        "previous_close": previous_close,
+        "fair_value": round(fair_value, 2) if fair_value is not None else None,
+        "gap_pct": gap_pct,
+        "predicted_open": predicted["value"] if predicted else None,
+        "fetched_at": now.isoformat(),
+    }
+
+
+@app.get("/api/premarket/positioning/live")
+async def positioning_live():
+    """Re-fetch Client/DII/FII/Pro OI + FII/DII cash from NSE and return a
+    plain-language outlook. Persists on success so the next morning brief
+    also sees the freshest published file.
+    """
+    return await positioning.refresh_positioning_from_nse(persist=True)
+
+
+@app.get("/api/premarket/score/live")
+async def score_live():
+    """Recompute the open-bias score from live GIFT + overnight cues about
+    once a minute for the dashboard. Does not overwrite the morning brief.
+    """
+    return await jobs.compute_live_score()
 
 
 def _classify_direction(previous_close: float | None, price: float | None, dead_zone_pct: float = 0.1) -> str | None:
@@ -222,6 +302,7 @@ async def create_paper_trade_endpoint(payload: dict):
         notes=payload.get("notes"),
         stop_loss=payload.get("stop_loss"),
         target_price=payload.get("target_price"),
+        expiry=payload.get("expiry"),
     )
     return trade
 
