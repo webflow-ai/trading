@@ -209,19 +209,67 @@ async def get_latest_pcr_snapshot(symbol: str) -> dict | None:
 
 # ---------------- paper trading journal ----------------
 
+# Columns that PostgREST rejected as unknown (PGRST204) — e.g. `expiry`
+# before migration 0008 is applied. Remembered for the process lifetime so
+# we don't keep re-sending fields the live schema doesn't have yet.
+_paper_trades_dropped_cols: set[str] = set()
+
+
+def _paper_trade_payload(trade: dict) -> dict:
+    """Drop Nones (optional columns) and any cols already known-missing."""
+    return {
+        k: v for k, v in trade.items()
+        if v is not None and k not in _paper_trades_dropped_cols
+    }
+
+
+def _pgrst_unknown_column(resp: httpx.Response) -> str | None:
+    """Parse PostgREST's PGRST204 'Could not find the X column of Y' body."""
+    if resp.status_code != 400:
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if body.get("code") != "PGRST204":
+        return None
+    msg = body.get("message") or ""
+    # "Could not find the 'expiry' column of 'paper_trades' in the schema cache"
+    marker = "Could not find the '"
+    if marker not in msg:
+        return None
+    rest = msg.split(marker, 1)[1]
+    col, _, _ = rest.partition("'")
+    return col or None
+
+
 async def create_paper_trade(trade: dict) -> dict:
     """Inserts one paper trade and returns the created row (including its
     `id`), so the caller has something to reference when closing it later.
     Falls back to echoing the input with id=None when Supabase isn't
     configured, same no-op-but-don't-crash convention as everything else
-    here."""
+    here.
+
+    If the live schema is behind (e.g. migration 0008's `expiry` column not
+    applied yet), drops the unknown column and retries once so the journal
+    still works — just without persisting that field until the migration
+    lands.
+    """
     if not configured():
         print("storage: SUPABASE_URL/SUPABASE_SERVICE_KEY not set, skipping paper trade insert")
         return {**trade, "id": None}
     client = await get_client()
     headers = _headers()
     headers["Prefer"] = "return=representation"
-    resp = await client.post(f"{SUPABASE_URL}/rest/v1/paper_trades", headers=headers, json=trade)
+    payload = _paper_trade_payload(trade)
+    resp = await client.post(f"{SUPABASE_URL}/rest/v1/paper_trades", headers=headers, json=payload)
+    unknown = _pgrst_unknown_column(resp)
+    if unknown and unknown in payload:
+        _paper_trades_dropped_cols.add(unknown)
+        print(f"storage: paper_trades has no '{unknown}' column yet — retrying without it "
+              f"(apply supabase/migrations/0008_paper_trades_expiry.sql)")
+        payload = _paper_trade_payload(trade)
+        resp = await client.post(f"{SUPABASE_URL}/rest/v1/paper_trades", headers=headers, json=payload)
     resp.raise_for_status()
     rows = resp.json()
     return rows[0] if rows else {**trade, "id": None}

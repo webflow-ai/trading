@@ -291,19 +291,23 @@ async def create_paper_trade_endpoint(payload: dict):
         raise HTTPException(400, "option_type must be 'CE' or 'PE'")
     if payload["action"] not in ("BUY", "SELL"):
         raise HTTPException(400, "action must be 'BUY' or 'SELL'")
-    trade = await paper_trading.open_trade(
-        strike=payload["strike"],
-        option_type=payload["option_type"],
-        action=payload["action"],
-        entry_price=payload["entry_price"],
-        lots=payload.get("lots", 1),
-        lot_size=payload.get("lot_size", paper_trading.DEFAULT_LOT_SIZE),
-        symbol=payload.get("symbol", "NIFTY"),
-        notes=payload.get("notes"),
-        stop_loss=payload.get("stop_loss"),
-        target_price=payload.get("target_price"),
-        expiry=payload.get("expiry"),
-    )
+    try:
+        trade = await paper_trading.open_trade(
+            strike=payload["strike"],
+            option_type=payload["option_type"],
+            action=payload["action"],
+            entry_price=payload["entry_price"],
+            lots=payload.get("lots", 1),
+            lot_size=payload.get("lot_size", paper_trading.DEFAULT_LOT_SIZE),
+            symbol=payload.get("symbol", "NIFTY"),
+            notes=payload.get("notes"),
+            stop_loss=payload.get("stop_loss"),
+            target_price=payload.get("target_price"),
+            expiry=payload.get("expiry"),
+        )
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text[:300] if e.response is not None else str(e)
+        raise HTTPException(502, f"paper trade save failed: {detail}") from e
     return trade
 
 

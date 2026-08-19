@@ -8,25 +8,37 @@ import storage
 
 
 class FakeResponse:
-    def __init__(self, json_data=None):
+    def __init__(self, json_data=None, status_code=200):
         self._json = json_data if json_data is not None else []
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            import httpx
+            req = httpx.Request("POST", "https://fake.supabase.co/rest/v1/paper_trades")
+            resp = httpx.Response(self.status_code, json=self._json, request=req)
+            raise httpx.HTTPStatusError(
+                f"{self.status_code}", request=req, response=resp,
+            )
 
     def json(self):
         return self._json
 
 
 class FakeAsyncClient:
-    def __init__(self, get_response=None, post_response=None, patch_response=None):
+    def __init__(self, get_response=None, post_response=None, patch_response=None, post_responses=None):
         self.calls = []
         self._get_response = get_response if get_response is not None else FakeResponse([])
         self._post_response = post_response if post_response is not None else FakeResponse()
+        self._post_responses = list(post_responses) if post_responses is not None else None
         self._patch_response = patch_response if patch_response is not None else FakeResponse()
 
     async def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
+        if self._post_responses is not None:
+            if not self._post_responses:
+                raise AssertionError("unexpected extra POST")
+            return self._post_responses.pop(0)
         return self._post_response
 
     async def patch(self, url, **kwargs):
@@ -45,6 +57,7 @@ def configured_supabase(monkeypatch):
     client instead of silently no-op'ing."""
     monkeypatch.setattr(storage, "SUPABASE_URL", "https://fake.supabase.co")
     monkeypatch.setattr(storage, "SUPABASE_KEY", "fake-service-key")
+    storage._paper_trades_dropped_cols.clear()
 
 
 @pytest.fixture
@@ -299,6 +312,50 @@ def test_create_paper_trade_posts_and_returns_representation(fake_client):
     assert url == "https://fake.supabase.co/rest/v1/paper_trades"
     assert kwargs["headers"]["Prefer"] == "return=representation"
     assert kwargs["json"] == trade
+
+
+def test_create_paper_trade_omits_none_optional_fields(fake_client):
+    fake_client._post_response = FakeResponse([{"id": 7, "strike": 24500, "status": "open"}])
+
+    trade = {
+        "trade_date": "2026-08-12", "strike": 24500, "option_type": "CE", "action": "BUY",
+        "lots": 1, "lot_size": 75, "entry_price": 120.5, "status": "open",
+        "notes": None, "stop_loss": None, "target_price": None, "expiry": None,
+    }
+    asyncio.run(storage.create_paper_trade(trade))
+
+    sent = fake_client.calls[0][2]["json"]
+    assert "notes" not in sent
+    assert "expiry" not in sent
+    assert sent["strike"] == 24500
+
+
+def test_create_paper_trade_retries_without_unknown_column(monkeypatch):
+    """Live schema may lag migrations (PGRST204) — drop the missing col and
+    retry so paper trading still works before 0008 is applied."""
+    fail = FakeResponse(
+        {"code": "PGRST204", "message": "Could not find the 'expiry' column of 'paper_trades' in the schema cache"},
+        status_code=400,
+    )
+    ok = FakeResponse([{"id": 9, "strike": 24500, "status": "open"}])
+    client = FakeAsyncClient(post_responses=[fail, ok])
+
+    async def fake_get_client():
+        return client
+    monkeypatch.setattr(storage, "get_client", fake_get_client)
+
+    trade = {
+        "trade_date": "2026-08-12", "strike": 24500, "option_type": "CE", "action": "BUY",
+        "lots": 1, "lot_size": 75, "entry_price": 120.5, "status": "open",
+        "expiry": "18-Aug-2026",
+    }
+    result = asyncio.run(storage.create_paper_trade(trade))
+
+    assert result["id"] == 9
+    assert len(client.calls) == 2
+    assert client.calls[0][2]["json"]["expiry"] == "18-Aug-2026"
+    assert "expiry" not in client.calls[1][2]["json"]
+    assert "expiry" in storage._paper_trades_dropped_cols
 
 
 def test_create_paper_trade_skips_when_not_configured(monkeypatch):
