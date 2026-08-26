@@ -1541,21 +1541,42 @@ function Hint({ children }) {
 
 function topOiRows(rows, oiKey, volKey, n = 4) {
   const totalVol = rows.reduce((s, r) => s + (Number(r[volKey]) || 0), 0);
+  const totalOi = rows.reduce((s, r) => s + (Number(r[oiKey]) || 0), 0);
   return [...rows]
     .filter((r) => r[oiKey] != null && r.strike != null)
     .sort((a, b) => (Number(b[oiKey]) || 0) - (Number(a[oiKey]) || 0))
     .slice(0, n)
     .map((r, i) => {
       const vol = Number(r[volKey]) || 0;
+      const oi = Number(r[oiKey]) || 0;
+      const isCall = oiKey === "ceOi";
       return {
         rank: i + 1,
         strike: r.strike,
-        oi: r[oiKey],
-        oiChg: oiKey === "ceOi" ? r.ceOiChg : r.peOiChg,
+        oi,
+        oiChg: isCall ? r.ceOiChg : r.peOiChg,
         vol,
         volPct: totalVol > 0 ? (vol / totalVol) * 100 : null,
+        oiPct: totalOi > 0 ? (oi / totalOi) * 100 : null,
+        ltp: isCall ? r.ceLtp : r.peLtp,
       };
     });
+}
+
+function oiSideMetrics(row, side, totalOi, totalVol) {
+  if (!row) return null;
+  const isCall = side === "ce";
+  const oi = Number(isCall ? row.ceOi : row.peOi) || 0;
+  const vol = Number(isCall ? row.ceVol : row.peVol) || 0;
+  return {
+    strike: row.strike,
+    oi,
+    oiChg: isCall ? row.ceOiChg : row.peOiChg,
+    vol,
+    volPct: totalVol > 0 ? (vol / totalVol) * 100 : null,
+    oiPct: totalOi > 0 ? (oi / totalOi) * 100 : null,
+    ltp: isCall ? row.ceLtp : row.peLtp,
+  };
 }
 
 async function fetchUpstoxChainLive(backendUrl, symbol = "NIFTY") {
@@ -1614,49 +1635,89 @@ function OiRankModal({ backendUrl, onClose }) {
   }, [onClose]);
 
   const rows = pack?.rows || [];
-  const callTop = topOiRows(rows, "ceOi", "ceVol", 4);
-  const putTop = topOiRows(rows, "peOi", "peVol", 4);
+  const spot = pack?.spot != null ? Number(pack.spot) : null;
   const totalCeOi = rows.reduce((s, r) => s + (Number(r.ceOi) || 0), 0);
   const totalPeOi = rows.reduce((s, r) => s + (Number(r.peOi) || 0), 0);
   const totalCeVol = rows.reduce((s, r) => s + (Number(r.ceVol) || 0), 0);
   const totalPeVol = rows.reduce((s, r) => s + (Number(r.peVol) || 0), 0);
-  const chainPcr = totalCeOi > 0 ? totalPeOi / totalCeOi : null;
+  const callTop = topOiRows(rows, "ceOi", "ceVol", 4);
+  const putTop = topOiRows(rows, "peOi", "peVol", 4);
+  const atmStrike = rows.reduce((best, r) => {
+    if (spot == null || r.strike == null) return best;
+    if (best == null || Math.abs(r.strike - spot) < Math.abs(best - spot)) return r.strike;
+    return best;
+  }, null);
+  const atmRow = rows.find((r) => r.strike === atmStrike) || null;
+  const atmCall = oiSideMetrics(atmRow, "ce", totalCeOi, totalCeVol);
+  const atmPut = oiSideMetrics(atmRow, "pe", totalPeOi, totalPeVol);
+  const atmDiff = spot != null && atmStrike != null ? atmStrike - spot : null;
+  const atmPcr = atmCall?.oi ? (atmPut?.oi || 0) / atmCall.oi : null;
+
+  const th = (label, align = "left") => (
+    <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: align }}>{label}</th>
+  );
+
+  const renderSideCells = (r, color) => (
+    <>
+      <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", color: T.fg }}>{fmt(r?.ltp, 2)}</td>
+      <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", color }}>{fmtOi(r?.oi)}</td>
+      <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", color: T.muted }}>
+        {r?.oiPct == null ? "—" : `${r.oiPct.toFixed(1)}%`}
+      </td>
+      <td style={{
+        padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right",
+        color: (r?.oiChg || 0) >= 0 ? T.put : T.call,
+      }}>
+        {r?.oiChg == null ? "—" : `${r.oiChg >= 0 ? "+" : ""}${fmtOi(r.oiChg)}`}
+      </td>
+      <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right" }}>{fmtOi(r?.vol)}</td>
+      <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", fontWeight: 700, color: T.cyan }}>
+        {r?.volPct == null ? "—" : `${r.volPct.toFixed(1)}%`}
+      </td>
+    </>
+  );
 
   const renderTable = (title, color, list, side) => (
-    <div style={{ flex: "1 1 280px", minWidth: 0 }}>
+    <div style={{ flex: "1 1 320px", minWidth: 0 }}>
       <div style={{ fontFamily: MONO, fontSize: 11, color, letterSpacing: ".06em", marginBottom: 8 }}>{title}</div>
       <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 11, minWidth: 320 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 11, minWidth: 460 }}>
           <thead>
             <tr style={{ color: T.muted, textAlign: "left" }}>
-              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}` }}>#</th>
-              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}` }}>Strike</th>
-              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>OI</th>
-              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Chg OI</th>
-              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Vol</th>
-              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Vol %</th>
+              {th("#")}
+              {th("Strike")}
+              {th("vs Spot", "right")}
+              {th("LTP", "right")}
+              {th("OI", "right")}
+              {th("OI %", "right")}
+              {th("Chg OI", "right")}
+              {th("Vol", "right")}
+              {th("Vol %", "right")}
             </tr>
           </thead>
           <tbody>
-            {list.map((r) => (
-              <tr key={`${side}-${r.strike}`}>
+            {list.map((r) => {
+              const isAtm = atmStrike != null && r.strike === atmStrike;
+              const diff = spot != null && r.strike != null ? r.strike - spot : null;
+              return (
+              <tr key={`${side}-${r.strike}`} style={{ background: isAtm ? `${T.amber}14` : "transparent" }}>
                 <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: T.muted }}>OI{r.rank}</td>
-                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, fontWeight: 700, color: T.fg }}>{r.strike}</td>
-                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", color }}>{fmtOi(r.oi)}</td>
+                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>
+                  <div style={{ fontWeight: 700, color: isAtm ? T.amber : T.fg }}>{r.strike}</div>
+                  {isAtm && <div style={{ fontSize: 9, fontWeight: 600, color: T.amber, letterSpacing: ".08em" }}>ATM</div>}
+                </td>
                 <td style={{
-                  padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right",
-                  color: (r.oiChg || 0) >= 0 ? T.put : T.call,
+                  padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", fontWeight: 600,
+                  color: diff == null ? T.muted : Math.abs(diff) < 0.5 ? T.amber : diff > 0 ? T.call : T.put,
                 }}>
-                  {r.oiChg == null ? "—" : `${r.oiChg >= 0 ? "+" : ""}${fmtOi(r.oiChg)}`}
+                  {diff == null ? "—" : `${diff >= 0 ? "+" : ""}${diff.toFixed(0)}`}
                 </td>
-                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right" }}>{fmtOi(r.vol)}</td>
-                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", fontWeight: 700, color: T.cyan }}>
-                  {r.volPct == null ? "—" : `${r.volPct.toFixed(1)}%`}
-                </td>
+                {renderSideCells(r, color)}
               </tr>
-            ))}
+              );
+            })}
             {!list.length && (
-              <tr><td colSpan={6} style={{ padding: 14, color: T.muted, textAlign: "center", fontFamily: DISP }}>No OI rows yet</td></tr>
+              <tr><td colSpan={9} style={{ padding: 14, color: T.muted, textAlign: "center", fontFamily: DISP }}>No OI rows yet</td></tr>
             )}
           </tbody>
         </table>
@@ -1677,7 +1738,7 @@ function OiRankModal({ backendUrl, onClose }) {
         onClick={(e) => e.stopPropagation()}
         style={{
           background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16,
-          width: "100%", maxWidth: 920, maxHeight: "88vh", overflow: "auto",
+          width: "100%", maxWidth: 1100, maxHeight: "88vh", overflow: "auto",
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -1685,7 +1746,7 @@ function OiRankModal({ backendUrl, onClose }) {
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>OPEN INTEREST · LIVE UPSTOX</div>
             <div style={{ fontSize: 18, fontWeight: 700, marginTop: 2 }}>Top OI strikes · NIFTY</div>
             <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, marginTop: 4 }}>
-              OI1–OI4 = highest open interest from Upstox. Vol % is that strike’s share of total call or put volume.
+              ATM shows call + put for the nearest strike. OI1–OI4 = highest open interest. Same fields everywhere: LTP, OI, OI %, Chg OI, Vol, Vol %.
               {pack?.expiry ? ` · expiry ${expiryLabel(pack.expiry)}` : ""}
               {pack?.updatedAt
                 ? ` · ${new Date(pack.updatedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit" })} IST`
@@ -1701,15 +1762,6 @@ function OiRankModal({ backendUrl, onClose }) {
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 14, marginTop: 14, flexWrap: "wrap" }}>
-          <Stat label="Spot" value={fmt(pack?.spot, 1)} />
-          <Stat label="Chain PCR" value={fmt(chainPcr, 2)} color={chainPcr == null ? T.muted : chainPcr > 1.05 ? T.put : chainPcr < 0.95 ? T.call : T.amber} />
-          <Stat label="Call OI" value={fmtOi(totalCeOi)} color={T.call} />
-          <Stat label="Put OI" value={fmtOi(totalPeOi)} color={T.put} />
-          <Stat label="Call vol" value={fmtOi(totalCeVol)} />
-          <Stat label="Put vol" value={fmtOi(totalPeVol)} />
-        </div>
-
         {err && (
           <div style={{ fontFamily: DISP, fontSize: 13, color: T.call, marginTop: 10, lineHeight: 1.45 }}>
             {err}
@@ -1723,10 +1775,58 @@ function OiRankModal({ backendUrl, onClose }) {
         {loading && !rows.length ? (
           <div style={{ fontFamily: DISP, fontSize: 13, color: T.muted, marginTop: 16 }}>Loading live Upstox option chain…</div>
         ) : rows.length ? (
-          <div style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
-            {renderTable("CALL OI 1–4", T.call, callTop, "ce")}
-            {renderTable("PUT OI 1–4", T.put, putTop, "pe")}
-          </div>
+          <>
+            {atmStrike != null && (
+              <div style={{
+                marginTop: 16, background: `${T.amber}12`, border: `1px solid ${T.amber}55`,
+                borderRadius: 12, padding: 12,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "baseline" }}>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 11, color: T.amber, letterSpacing: ".06em" }}>ATM STRIKE</div>
+                    <div style={{ fontFamily: MONO, fontSize: 28, fontWeight: 700, color: T.amber, lineHeight: 1.1, marginTop: 2 }}>
+                      {atmStrike}
+                    </div>
+                    <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, marginTop: 4 }}>
+                      Spot {fmt(spot, 1)}
+                      {atmDiff != null ? ` · vs spot ${atmDiff >= 0 ? "+" : ""}${atmDiff.toFixed(0)}` : ""}
+                      {atmPcr != null ? ` · strike PCR ${fmt(atmPcr, 2)}` : ""}
+                    </div>
+                  </div>
+                  <Pill color={T.amber}>nearest to spot</Pill>
+                </div>
+                <div style={{ overflowX: "auto", marginTop: 12 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 11, minWidth: 720 }}>
+                    <thead>
+                      <tr style={{ color: T.muted, textAlign: "left" }}>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}` }}>Side</th>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>LTP</th>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>OI</th>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>OI %</th>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Chg OI</th>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Vol</th>
+                        <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Vol %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td style={{ padding: "8px 8px", borderBottom: `1px solid ${T.line}88`, fontWeight: 700, color: T.call }}>Call</td>
+                        {renderSideCells(atmCall, T.call)}
+                      </tr>
+                      <tr>
+                        <td style={{ padding: "8px 8px", borderBottom: `1px solid ${T.line}88`, fontWeight: 700, color: T.put }}>Put</td>
+                        {renderSideCells(atmPut, T.put)}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+              {renderTable("CALL OI 1–4", T.call, callTop, "ce")}
+              {renderTable("PUT OI 1–4", T.put, putTop, "pe")}
+            </div>
+          </>
         ) : null}
       </div>
     </div>
@@ -2107,6 +2207,30 @@ function Th({ children, hint }) {
   );
 }
 
+function SectionCard({ borderColor, children }) {
+  return (
+    <div className="section-card" style={{
+      background: T.panel, border: `1px solid ${borderColor || T.line}`,
+      borderRadius: 14, padding: 16, marginTop: 12,
+    }}>
+      {children}
+    </div>
+  );
+}
+
+function StatGrid({ children }) {
+  return (
+    <div className="stat-grid" style={{
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 140px), 1fr))",
+      gap: 12,
+      marginTop: 14,
+    }}>
+      {children}
+    </div>
+  );
+}
+
 function ContributionAlertsView({ backendUrl }) {
   const narrow = useNarrow(900);
   const [snap, setSnap] = useState(null);
@@ -2312,16 +2436,20 @@ function ContributionAlertsView({ backendUrl }) {
         <div className="contrib-main">
       <PcrOiCard backendUrl={backendUrl} />
 
-      <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginTop: 12 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-          <div>
+      <SectionCard>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
+          <div style={{ minWidth: 0, flex: "1 1 200px" }}>
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>1 · FACT</div>
             <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Who dragged Nifty today</div>
-            <Hint>Green points pushed Nifty up. Pink points pulled it down. Sorted so the biggest influence is on top — even if that influence was negative.</Hint>
+            <Hint>
+              {narrow
+                ? "Green = pushed Nifty up. Pink = pulled it down. Biggest influence on top."
+                : "Green points pushed Nifty up. Pink points pulled it down. Sorted so the biggest influence is on top — even if that influence was negative."}
+            </Hint>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <Pill color={recon.data_stale ? T.amber : T.put}>
-              {recon.data_stale ? "prices look stale or incomplete" : "live prices ok"}
+              {recon.data_stale ? (narrow ? "stale prices" : "prices look stale or incomplete") : "live prices ok"}
             </Pill>
             <button onClick={load} style={{ background: T.panel2, color: T.cyan, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontFamily: MONO }}>
               {loading ? "…" : "↻"}
@@ -2334,17 +2462,58 @@ function ContributionAlertsView({ backendUrl }) {
             {err ? ` (${err})` : ""}
           </div>
         )}
-        <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
+        <StatGrid>
           <Stat label="Nifty now" value={fmt(attr?.index_ltp, 1)} sub={attr?.index_prev_close != null ? `yesterday close ${fmt(attr.index_prev_close, 1)}` : ""} />
           <Stat label="Nifty today" value={fmtSigned(recon.actual_index_pts, 1)} color={(recon.actual_index_pts || 0) >= 0 ? T.put : T.call} sub="points since yesterday" />
-          <Stat label="From these 20 stocks" value={fmtSigned(recon.sum_contribution_pts, 1)} sub={`we only cover ${fmt(recon.coverage_pct, 1)}% of Nifty`} />
-          <Stat label="The other 30 stocks" value={fmtSigned(recon.unexplained_pts, 1)} color={recon.reconciliation_stale ? T.amber : T.muted} sub="leftover points we didn't assign" />
-        </div>
+          <Stat label={narrow ? "From top 20" : "From these 20 stocks"} value={fmtSigned(recon.sum_contribution_pts, 1)} sub={`we only cover ${fmt(recon.coverage_pct, 1)}% of Nifty`} />
+          <Stat label={narrow ? "Other 30" : "The other 30 stocks"} value={fmtSigned(recon.unexplained_pts, 1)} color={recon.reconciliation_stale ? T.amber : T.muted} sub="leftover points we didn't assign" />
+        </StatGrid>
         <Hint>
-          The leftover is normal — we only track the 20 heaviest names (~75% of Nifty), not all 50.
-          Worry only if leftover is huge <i>and</i> the badge says prices look stale.
+          {narrow
+            ? "Leftover is normal — we only track the 20 heaviest names."
+            : <>The leftover is normal — we only track the 20 heaviest names (~75% of Nifty), not all 50. Worry only if leftover is huge <i>and</i> the badge says prices look stale.</>}
         </Hint>
-        <div style={{ overflowX: "auto", marginTop: 14 }}>
+        {narrow ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
+            {movers.map((s) => (
+              <div key={s.symbol} style={{
+                background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 12px",
+                color: s.quote_stale ? T.muted : T.fg,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontFamily: DISP, fontWeight: 700 }}>{s.symbol}</div>
+                    <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>{s.name}</div>
+                  </div>
+                  <div style={{
+                    fontFamily: MONO, fontWeight: 700, fontSize: 16,
+                    color: (s.contribution_pts || 0) >= 0 ? T.put : T.call, flexShrink: 0,
+                  }}>
+                    {fmtSigned(s.contribution_pts, 2)} <span style={{ fontSize: 11, fontWeight: 500, color: T.muted }}>pts</span>
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 10 }}>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>WEIGHT</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12 }}>{fmt(s.weight_pct, 1)}%</div>
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>MOVE</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12, color: (s.pct_change || 0) >= 0 ? T.put : T.call }}>{fmtSigned(s.pct_change, 2)}%</div>
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>PRICE</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12 }}>{fmt(s.ltp, 2)}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {!movers.length && (
+              <div style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>Connect Upstox to see which stocks moved Nifty.</div>
+            )}
+          </div>
+        ) : (
+        <div style={{ overflowX: "auto", marginTop: 14, WebkitOverflowScrolling: "touch" }}>
           <table style={{ width: "100%", minWidth: 480, borderCollapse: "collapse", fontFamily: MONO, fontSize: 11 }}>
             <thead>
               <tr style={{ color: T.muted, textAlign: "left" }}>
@@ -2374,18 +2543,23 @@ function ContributionAlertsView({ backendUrl }) {
             </tbody>
           </table>
         </div>
-      </div>
+        )}
+      </SectionCard>
 
-      <div style={{ background: T.panel, border: `1px solid ${T.amber}55`, borderRadius: 14, padding: 16, marginTop: 12 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-          <div>
-            <div style={{ fontFamily: MONO, fontSize: 11, color: T.amber }}>2 · HEADS-UP  ·  not a prediction</div>
+      <SectionCard borderColor={`${T.amber}55`}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
+          <div style={{ minWidth: 0, flex: "1 1 200px" }}>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: T.amber }}>2 · HEADS-UP{narrow ? "" : "  ·  not a prediction"}</div>
             <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Unusual activity in heavy stocks</div>
             <Hint>
+              {narrow
+                ? <>Busy score 0–100. Alert only if score ≥ <b style={{ color: T.fg }}>{threshold}</b>. Empty feed = quiet — that is OK.</>
+                : <>
               Each stock gets a 0–100 “busy” score from volume spikes, options/futures OI (if available),
               price stretching away from the day’s average (VWAP), and buy vs sell pressure.
               An alert only appears if the score reaches <b style={{ color: T.fg }}>{threshold}</b> — that bar is set high so you are not flooded.
               Empty feed = the system thinks nothing unusual is going on. That is OK.
+                </>}
             </Hint>
           </div>
           <Pill color={T.amber}>alert if score ≥ {threshold}</Pill>
@@ -2398,7 +2572,7 @@ function ContributionAlertsView({ backendUrl }) {
               setNotifyPerm(perm);
             }}
             style={{
-              marginTop: 12, background: T.panel2, color: T.fg, border: `1px solid ${T.call}66`,
+              marginTop: 12, width: narrow ? "100%" : "auto", background: T.panel2, color: T.fg, border: `1px solid ${T.call}66`,
               borderRadius: 8, padding: "8px 12px", fontSize: 12, cursor: "pointer", fontFamily: DISP,
             }}
           >
@@ -2411,7 +2585,7 @@ function ContributionAlertsView({ backendUrl }) {
 
         <div style={{ marginTop: 14 }}>
           <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>Recent heads-ups</div>
-          <Hint>These are a quiet log only. The pink alert is a short pop-up (and a browser notification if you allowed it), not a card that stays here.</Hint>
+          <Hint>{narrow ? "Quiet log only — alerts are short pop-ups." : "These are a quiet log only. The pink alert is a short pop-up (and a browser notification if you allowed it), not a card that stays here."}</Hint>
           {alerts.length === 0 && (
             <div style={{ fontFamily: DISP, fontSize: 13, color: T.muted, marginTop: 10, padding: 12, background: T.panel2, borderRadius: 8, border: `1px dashed ${T.line}` }}>
               None so far this session. Quiet is the default.
@@ -2431,8 +2605,46 @@ function ContributionAlertsView({ backendUrl }) {
         </div>
 
         <div style={{ fontSize: 14, fontWeight: 700, marginTop: 16, marginBottom: 4 }}>Busy-ness of each heavy stock</div>
-        <Hint>Higher score = more unusual vs that stock’s own recent tape. Colour: quiet (teal), elevated (amber), would-alert (pink).</Hint>
-        <div style={{ overflowX: "auto", marginTop: 8 }}>
+        <Hint>{narrow ? "Higher = more unusual. Teal quiet · amber elevated · pink would-alert." : "Higher score = more unusual vs that stock’s own recent tape. Colour: quiet (teal), elevated (amber), would-alert (pink)."}</Hint>
+        {narrow ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+            {scored.map((s) => (
+              <div key={s.symbol} style={{
+                background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 12px",
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+                  <div style={{ fontFamily: DISP, fontWeight: 700 }}>{s.symbol}</div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontFamily: MONO, fontWeight: 700, fontSize: 18, color: urgencyColor(s.score) }}>{fmt(s.score, 0)}</div>
+                    <div style={{ fontFamily: DISP, fontSize: 10, color: T.muted }}>{urgencyLabel(s.score)}</div>
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>VOLUME</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12 }}>{s.volume_surge == null ? "—" : `${fmt(s.volume_surge, 1)}×`}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>OI</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12 }}>{fmtSigned(s.oi_change_pct, 1)}{s.oi_change_pct == null ? "" : "%"}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>VS VWAP</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12 }}>{fmtSigned(s.vwap_dev_pct, 2)}{s.vwap_dev_pct == null ? "" : "%"}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted }}>BUY/SELL</div>
+                    <div style={{ fontFamily: MONO, fontSize: 12 }}>{fmtSigned(s.imbalance, 2)}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {!scored.length && (
+              <div style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>No scores until Upstox is connected.</div>
+            )}
+          </div>
+        ) : (
+        <div style={{ overflowX: "auto", marginTop: 8, WebkitOverflowScrolling: "touch" }}>
           <table style={{ width: "100%", minWidth: 520, borderCollapse: "collapse", fontFamily: MONO, fontSize: 11 }}>
             <thead>
               <tr style={{ color: T.muted, textAlign: "left" }}>
@@ -2464,36 +2676,41 @@ function ContributionAlertsView({ backendUrl }) {
             </tbody>
           </table>
         </div>
-      </div>
+        )}
+      </SectionCard>
 
-      <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginTop: 12 }}>
+      <SectionCard>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
-          <div>
+          <div style={{ minWidth: 0, flex: "1 1 200px" }}>
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>3 · REPORT CARD</div>
             <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Did the heads-up work on old days?</div>
             <Hint>
-              This does not trade. It asks: on past days, when a heavy stock looked this busy, did Nifty move at least about 40 points in the next 15 minutes?
-              Use this before you trust Section 2. You can skip it while learning the two tables above.
+              {narrow
+                ? "Replays past days: when busy, did Nifty move ~40 pts in 15 min?"
+                : "This does not trade. It asks: on past days, when a heavy stock looked this busy, did Nifty move at least about 40 points in the next 15 minutes? Use this before you trust Section 2. You can skip it while learning the two tables above."}
             </Hint>
           </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <div className="report-controls" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", width: narrow ? "100%" : "auto" }}>
             <span style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>Look back</span>
             <input type="number" min={5} max={60} value={btDays} onChange={(e) => setBtDays(+e.target.value)}
               style={{ width: 56, background: T.ink, border: `1px solid ${T.line}`, color: T.fg, borderRadius: 8, padding: "6px 8px", fontFamily: MONO, fontSize: 12 }} />
             <span style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>days</span>
             <button onClick={runBacktest} disabled={btLoading}
-              style={{ background: T.cyan, color: T.ink, border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 600, cursor: "pointer", fontSize: 12 }}>
+              style={{
+                background: T.cyan, color: T.ink, border: "none", borderRadius: 8, padding: "8px 14px",
+                fontWeight: 600, cursor: "pointer", fontSize: 12, flex: narrow ? "1 1 auto" : "none",
+              }}>
               {btLoading ? "Checking…" : "Run check"}
             </button>
           </div>
         </div>
         {btErr && <div style={{ fontFamily: DISP, fontSize: 13, color: T.call, marginTop: 8 }}>{btErr}</div>}
         {backtest?.metrics && (
-          <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
-            <Stat label="When it beeped, Nifty really moved" value={backtest.metrics.precision_pct != null ? `${backtest.metrics.precision_pct}%` : "—"} color={T.cyan} sub="precision — higher = fewer false alarms" />
-            <Stat label="Big Nifty moves we had already flagged" value={backtest.metrics.recall_pct != null ? `${backtest.metrics.recall_pct}%` : "—"} color={T.amber} sub="recall — higher = fewer missed moves" />
-            <Stat label="Heads-ups in this sample" value={backtest.metrics.alert_count} sub={`busy-score bar ${backtest.metrics.score_threshold}`} />
-          </div>
+          <StatGrid>
+            <Stat label={narrow ? "Precision" : "When it beeped, Nifty really moved"} value={backtest.metrics.precision_pct != null ? `${backtest.metrics.precision_pct}%` : "—"} color={T.cyan} sub="precision — higher = fewer false alarms" />
+            <Stat label={narrow ? "Recall" : "Big Nifty moves we had already flagged"} value={backtest.metrics.recall_pct != null ? `${backtest.metrics.recall_pct}%` : "—"} color={T.amber} sub="recall — higher = fewer missed moves" />
+            <Stat label={narrow ? "Alerts" : "Heads-ups in this sample"} value={backtest.metrics.alert_count} sub={`busy-score bar ${backtest.metrics.score_threshold}`} />
+          </StatGrid>
         )}
         {mx && (
           <div style={{ marginTop: 12, fontFamily: DISP, fontSize: 13, color: T.muted, lineHeight: 1.55 }}>
@@ -2505,8 +2722,8 @@ function ContributionAlertsView({ backendUrl }) {
         )}
         {sweep.length > 1 && (
           <>
-            <Hint>Chart: if we make the alarm harder to trigger (threshold →), false alarms usually fall (teal) but we miss more real moves (amber).</Hint>
-            <div style={{ height: 240, marginTop: 8 }}>
+            <Hint>{narrow ? "Harder threshold → fewer false alarms, more misses." : "Chart: if we make the alarm harder to trigger (threshold →), false alarms usually fall (teal) but we miss more real moves (amber)."}</Hint>
+            <div style={{ height: narrow ? 200 : 240, marginTop: 8 }}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={sweep} margin={{ top: 8, right: 12, bottom: 4, left: -8 }}>
                   <CartesianGrid stroke={T.line} strokeDasharray="2 4" vertical={false} />
@@ -2520,7 +2737,7 @@ function ContributionAlertsView({ backendUrl }) {
             </div>
           </>
         )}
-      </div>
+      </SectionCard>
         </div>
       </div>
     </div>
@@ -2657,6 +2874,10 @@ export default function App() {
         @media (max-width: 900px) {
           .contrib-layout { flex-direction: column; }
           .news-aside { flex: none; width: 100%; position: static; max-height: none; overflow: visible; }
+          .contrib-main { flex: none; width: 100%; }
+          .section-card { padding: 12px !important; border-radius: 12px !important; }
+          .stat-grid { grid-template-columns: 1fr 1fr !important; gap: 10px !important; }
+          .report-controls { width: 100%; }
           .pcr-hero { font-size: 36px !important; }
           .spot-scroll { height: 220px !important; }
           .ua-toasts { top: auto !important; bottom: calc(12px + env(safe-area-inset-bottom)); left: 8px; right: 8px; width: auto !important; max-width: none !important; }
