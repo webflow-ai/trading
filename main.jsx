@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   LineChart, Line, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip,
   ReferenceLine, ReferenceArea, ReferenceDot, ResponsiveContainer,
@@ -24,6 +24,16 @@ const T = {
 };
 const DISP = "'Space Grotesk', system-ui, sans-serif";
 const MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', monospace";
+
+function useNarrow(bp = 900) {
+  const [narrow, setNarrow] = useState(() => typeof window !== "undefined" && window.innerWidth < bp);
+  useEffect(() => {
+    const onResize = () => setNarrow(window.innerWidth < bp);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [bp]);
+  return narrow;
+}
 
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"];
 // TradingView won't embed NSE index/futures data on third-party sites (their
@@ -686,7 +696,7 @@ function SpotChart({ backendUrl, symbol }) {
               ● Market closed — showing last close
             </span>
           )}
-          <div style={{ display: "flex", gap: 4 }}>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             {Object.keys(CHART_MODES).map((k) => (
               <button key={k} onClick={() => setMode(k)}
                 style={{
@@ -762,7 +772,7 @@ function SpotChart({ backendUrl, symbol }) {
         </div>
       </div>
       <div style={{ position: "relative" }}>
-        <div ref={scrollRef} onScroll={handleScroll} style={{
+        <div ref={scrollRef} onScroll={handleScroll} className="spot-scroll" style={{
           height: 280, overflowX: "auto", overflowY: "hidden",
           touchAction: "pan-x", WebkitOverflowScrolling: "touch",
         }}>
@@ -1001,7 +1011,7 @@ function Pill({ children, color, dot }) {
 }
 function Stat({ label, value, sub, color }) {
   return (
-    <div style={{ flex: 1, minWidth: 0 }}>
+    <div style={{ flex: "1 1 140px", minWidth: 140 }}>
       <div style={{ fontFamily: DISP, fontSize: 10, letterSpacing: ".12em", textTransform: "uppercase", color: T.muted }}>{label}</div>
       <div style={{ fontFamily: MONO, fontSize: 20, fontWeight: 600, color: color || T.fg, marginTop: 2 }}>{value}</div>
       {sub && <div style={{ fontFamily: MONO, fontSize: 11, color: T.muted, marginTop: 1 }}>{sub}</div>}
@@ -1518,7 +1528,1008 @@ function detectDefaultBackendUrl() {
 }
 const DEFAULT_BACKEND_URL = detectDefaultBackendUrl();
 
+function fmtSigned(v, d = 2) {
+  if (v == null || isNaN(v)) return "—";
+  const n = Number(v);
+  const s = n.toFixed(d);
+  return n > 0 ? `+${s}` : s;
+}
+
+function Hint({ children }) {
+  return <div style={{ fontFamily: DISP, fontSize: 13, color: T.muted, lineHeight: 1.5, marginTop: 6 }}>{children}</div>;
+}
+
+function topOiRows(rows, oiKey, volKey, n = 4) {
+  const totalVol = rows.reduce((s, r) => s + (Number(r[volKey]) || 0), 0);
+  return [...rows]
+    .filter((r) => r[oiKey] != null && r.strike != null)
+    .sort((a, b) => (Number(b[oiKey]) || 0) - (Number(a[oiKey]) || 0))
+    .slice(0, n)
+    .map((r, i) => {
+      const vol = Number(r[volKey]) || 0;
+      return {
+        rank: i + 1,
+        strike: r.strike,
+        oi: r[oiKey],
+        oiChg: oiKey === "ceOi" ? r.ceOiChg : r.peOiChg,
+        vol,
+        volPct: totalVol > 0 ? (vol / totalVol) * 100 : null,
+      };
+    });
+}
+
+async function fetchUpstoxChainLive(backendUrl, symbol = "NIFTY") {
+  const base = backendUrl.replace(/\/$/, "");
+  const res = await fetch(`${base}/api/upstox/optionchain?symbol=${symbol}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (!json.connected) {
+    const err = new Error(json.error || "Upstox not connected — visit /api/upstox/login");
+    err.code = "upstox_disconnected";
+    throw err;
+  }
+  if (!(json.rows || []).length) {
+    throw new Error(json.error || "Upstox returned an empty option chain");
+  }
+  return {
+    rows: json.rows,
+    spot: json.spot,
+    expiry: json.expiry,
+    source: "upstox",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function OiRankModal({ backendUrl, onClose }) {
+  const [pack, setPack] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loginHint, setLoginHint] = useState("");
+
+  const load = useCallback(async (quiet = false) => {
+    if (!backendUrl) return;
+    if (!quiet) setLoading(true);
+    try {
+      const next = await fetchUpstoxChainLive(backendUrl, "NIFTY");
+      setPack(next);
+      setErr("");
+      setLoginHint("");
+    } catch (e) {
+      setErr(e.message);
+      setLoginHint(e.code === "upstox_disconnected" ? `${backendUrl.replace(/\/$/, "")}/api/upstox/login` : "");
+      if (!quiet) setPack(null);
+    } finally { setLoading(false); }
+  }, [backendUrl]);
+
+  useEffect(() => { load(false); }, [load]);
+  // Live while the modal is open — same cadence as the PCR option-chain panel.
+  useEffect(() => {
+    const id = setInterval(() => load(true), 3000);
+    return () => clearInterval(id);
+  }, [load]);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const rows = pack?.rows || [];
+  const callTop = topOiRows(rows, "ceOi", "ceVol", 4);
+  const putTop = topOiRows(rows, "peOi", "peVol", 4);
+  const totalCeOi = rows.reduce((s, r) => s + (Number(r.ceOi) || 0), 0);
+  const totalPeOi = rows.reduce((s, r) => s + (Number(r.peOi) || 0), 0);
+  const totalCeVol = rows.reduce((s, r) => s + (Number(r.ceVol) || 0), 0);
+  const totalPeVol = rows.reduce((s, r) => s + (Number(r.peVol) || 0), 0);
+  const chainPcr = totalCeOi > 0 ? totalPeOi / totalCeOi : null;
+
+  const renderTable = (title, color, list, side) => (
+    <div style={{ flex: "1 1 280px", minWidth: 0 }}>
+      <div style={{ fontFamily: MONO, fontSize: 11, color, letterSpacing: ".06em", marginBottom: 8 }}>{title}</div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: MONO, fontSize: 11, minWidth: 320 }}>
+          <thead>
+            <tr style={{ color: T.muted, textAlign: "left" }}>
+              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}` }}>#</th>
+              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}` }}>Strike</th>
+              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>OI</th>
+              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Chg OI</th>
+              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Vol</th>
+              <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, textAlign: "right" }}>Vol %</th>
+            </tr>
+          </thead>
+          <tbody>
+            {list.map((r) => (
+              <tr key={`${side}-${r.strike}`}>
+                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: T.muted }}>OI{r.rank}</td>
+                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, fontWeight: 700, color: T.fg }}>{r.strike}</td>
+                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", color }}>{fmtOi(r.oi)}</td>
+                <td style={{
+                  padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right",
+                  color: (r.oiChg || 0) >= 0 ? T.put : T.call,
+                }}>
+                  {r.oiChg == null ? "—" : `${r.oiChg >= 0 ? "+" : ""}${fmtOi(r.oiChg)}`}
+                </td>
+                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right" }}>{fmtOi(r.vol)}</td>
+                <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, textAlign: "right", fontWeight: 700, color: T.cyan }}>
+                  {r.volPct == null ? "—" : `${r.volPct.toFixed(1)}%`}
+                </td>
+              </tr>
+            ))}
+            {!list.length && (
+              <tr><td colSpan={6} style={{ padding: 14, color: T.muted, textAlign: "center", fontFamily: DISP }}>No OI rows yet</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(10,15,30,0.78)", zIndex: 2500,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 16, paddingBottom: "max(16px, env(safe-area-inset-bottom))",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16,
+          width: "100%", maxWidth: 920, maxHeight: "88vh", overflow: "auto",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>OPEN INTEREST · LIVE UPSTOX</div>
+            <div style={{ fontSize: 18, fontWeight: 700, marginTop: 2 }}>Top OI strikes · NIFTY</div>
+            <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, marginTop: 4 }}>
+              OI1–OI4 = highest open interest from Upstox. Vol % is that strike’s share of total call or put volume.
+              {pack?.expiry ? ` · expiry ${expiryLabel(pack.expiry)}` : ""}
+              {pack?.updatedAt
+                ? ` · ${new Date(pack.updatedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit" })} IST`
+                : ""}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <Pill color={rows.length ? T.put : T.amber} dot={!!rows.length}>{rows.length ? "Live Upstox" : "Waiting"}</Pill>
+            <button onClick={() => load(false)} style={{ background: T.panel2, color: T.cyan, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontFamily: MONO }}>
+              {loading ? "…" : "↻"}
+            </button>
+            <button onClick={onClose} aria-label="Close" style={{ background: "transparent", border: "none", color: T.muted, cursor: "pointer", fontSize: 18, lineHeight: 1 }}>✕</button>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 14, marginTop: 14, flexWrap: "wrap" }}>
+          <Stat label="Spot" value={fmt(pack?.spot, 1)} />
+          <Stat label="Chain PCR" value={fmt(chainPcr, 2)} color={chainPcr == null ? T.muted : chainPcr > 1.05 ? T.put : chainPcr < 0.95 ? T.call : T.amber} />
+          <Stat label="Call OI" value={fmtOi(totalCeOi)} color={T.call} />
+          <Stat label="Put OI" value={fmtOi(totalPeOi)} color={T.put} />
+          <Stat label="Call vol" value={fmtOi(totalCeVol)} />
+          <Stat label="Put vol" value={fmtOi(totalPeVol)} />
+        </div>
+
+        {err && (
+          <div style={{ fontFamily: DISP, fontSize: 13, color: T.call, marginTop: 10, lineHeight: 1.45 }}>
+            {err}
+            {loginHint && (
+              <>
+                {" "}Open <a href={loginHint} style={{ color: T.cyan, overflowWrap: "anywhere" }}>{loginHint}</a> once, then refresh.
+              </>
+            )}
+          </div>
+        )}
+        {loading && !rows.length ? (
+          <div style={{ fontFamily: DISP, fontSize: 13, color: T.muted, marginTop: 16 }}>Loading live Upstox option chain…</div>
+        ) : rows.length ? (
+          <div style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+            {renderTable("CALL OI 1–4", T.call, callTop, "ce")}
+            {renderTable("PUT OI 1–4", T.put, putTop, "pe")}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function PcrOiCard({ backendUrl }) {
+  const [snap, setSnap] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [metric, setMetric] = useState("oi");
+  const [showOi, setShowOi] = useState(false);
+  const [oiLive, setOiLive] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!backendUrl) return;
+    setLoading(true);
+    const base = backendUrl.replace(/\/$/, "");
+    let next = null;
+    let live = false;
+    let loadErr = "";
+    try {
+      const chain = await fetchUpstoxChainLive(backendUrl, "NIFTY");
+      const putOi = chain.rows.reduce((s, r) => s + (Number(r.peOi) || 0), 0);
+      const callOi = chain.rows.reduce((s, r) => s + (Number(r.ceOi) || 0), 0);
+      const putVol = chain.rows.reduce((s, r) => s + (Number(r.peVol) || 0), 0);
+      const callVol = chain.rows.reduce((s, r) => s + (Number(r.ceVol) || 0), 0);
+      next = {
+        t: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false }).slice(0, 5),
+        pcrOi: callOi ? putOi / callOi : null,
+        pcrVol: callVol ? putVol / callVol : null,
+        putOi, callOi,
+      };
+      live = true;
+    } catch (e) {
+      loadErr = e.message;
+      try {
+        const res = await fetch(`${base}/api/pcr/today?symbol=NIFTY`);
+        if (res.ok) {
+          next = normalizeSnapshot(await res.json());
+          if (next) loadErr = `${e.message} · showing last PCR cache`;
+        }
+      } catch { /* keep upstox error */ }
+    }
+    setSnap(next);
+    setOiLive(live);
+    setErr(next ? loadErr : (loadErr || "No PCR reading yet"));
+    setLoading(false);
+  }, [backendUrl]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (!backendUrl) return;
+    // Live Upstox OI while this card is on screen (market hours or not —
+    // Upstox still returns the last session chain when closed).
+    const id = setInterval(load, marketStatus().open ? 5000 : 60_000);
+    return () => clearInterval(id);
+  }, [backendUrl, load]);
+
+  const pcrVal = metric === "oi" ? snap?.pcrOi : snap?.pcrVol;
+  const sentiment = pcrVal == null
+    ? { label: "—", color: T.muted }
+    : pcrVal > 1.05 ? { label: "Put-heavy", color: T.put }
+      : pcrVal < 0.95 ? { label: "Call-heavy", color: T.call }
+        : { label: "Balanced", color: T.amber };
+
+  return (
+    <>
+      <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>NIFTY PCR</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Put-Call Ratio</div>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <Pill color={oiLive ? T.put : T.amber} dot={oiLive}>{oiLive ? "Live Upstox" : "Not live"}</Pill>
+            <button
+              onClick={() => setShowOi(true)}
+              style={{
+                background: T.cyan, color: T.ink, border: "none", borderRadius: 8,
+                padding: "8px 14px", fontWeight: 700, cursor: "pointer", fontFamily: MONO, fontSize: 12,
+              }}
+            >
+              OI
+            </button>
+            <button onClick={load} style={{ background: T.panel2, color: T.cyan, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontFamily: MONO }}>
+              {loading ? "…" : "↻"}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 16, flexWrap: "wrap", marginTop: 12 }}>
+          <div>
+            <div style={{ fontFamily: DISP, fontSize: 10, letterSpacing: ".12em", textTransform: "uppercase", color: T.muted }}>
+              Current PCR ({metric === "oi" ? "OI" : "Volume"})
+            </div>
+            <div className="pcr-hero" style={{ fontFamily: MONO, fontSize: 48, fontWeight: 600, lineHeight: 1, color: T.fg }}>
+              {fmt(pcrVal)}
+            </div>
+          </div>
+          <div style={{ paddingBottom: 6 }}>
+            <Pill color={sentiment.color}>{sentiment.label}</Pill>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 6, marginTop: 12, flexWrap: "wrap" }}>
+          {[["oi", "PCR · Open Interest"], ["vol", "PCR · Volume"]].map(([k, lbl]) => (
+            <button key={k} onClick={() => setMetric(k)}
+              style={{
+                padding: "7px 12px", borderRadius: 8, cursor: "pointer", fontFamily: MONO, fontSize: 11,
+                background: metric === k ? T.panel2 : "transparent", color: metric === k ? T.cyan : T.muted,
+                border: `1px solid ${metric === k ? T.cyan + "66" : T.line}`,
+              }}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 16, marginTop: 14, paddingTop: 14, borderTop: `1px solid ${T.line}`, flexWrap: "wrap" }}>
+          <Stat label="Put OI" value={fmtOi(snap?.putOi)} color={T.put} />
+          <Stat label="Call OI" value={fmtOi(snap?.callOi)} color={T.call} />
+          <Stat label="Put/Call" value={snap?.putOi != null && snap?.callOi ? fmtOi(snap.putOi + snap.callOi) : "—"} sub="combined OI" />
+        </div>
+        {err && <div style={{ fontFamily: DISP, fontSize: 12, color: T.call, marginTop: 8 }}>{err}</div>}
+      </div>
+      {showOi && <OiRankModal backendUrl={backendUrl} onClose={() => setShowOi(false)} />}
+    </>
+  );
+}
+
+const UNUSUAL_TOAST_MS = 8000;
+
+function alertKey(a) {
+  return `${a.fired_at || ""}|${a.symbol || ""}`;
+}
+
+function toastKey(a) {
+  if (a?.kind === "news") return `news|${a.headline || ""}`;
+  return alertKey(a);
+}
+
+function fireBrowserNotification(alert) {
+  if (typeof Notification === "undefined") return;
+  if (Notification.permission !== "granted") return;
+  try {
+    const isNews = alert.kind === "news";
+    const n = new Notification(
+      isNews ? `News · ${(alert.topic || "market").toUpperCase()}` : `${alert.symbol} — unusual activity`,
+      {
+        body: isNews
+          ? (alert.headline || "High-impact headline")
+          : (alert.message || "A heavy Nifty stock looks unusually busy. Not a prediction."),
+        tag: toastKey(alert),
+        requireInteraction: false,
+      },
+    );
+    setTimeout(() => { try { n.close(); } catch { /* already closed */ } }, UNUSUAL_TOAST_MS);
+  } catch { /* blocked / insecure context */ }
+}
+
+function UnusualActivityToasts({ toasts, onDismiss }) {
+  if (!toasts.length) return null;
+  return (
+    <div className="ua-toasts" style={{ position: "fixed", top: 16, right: 16, zIndex: 3000, display: "flex", flexDirection: "column", gap: 8, width: 360, maxWidth: "calc(100vw - 24px)" }}>
+      {toasts.map((a) => {
+        const isNews = a.kind === "news";
+        const color = isNews ? T.amber : T.call;
+        const key = a.kind === "news" ? `news|${a.headline}` : alertKey(a);
+        return (
+        <div
+          key={key}
+          style={{
+            background: T.panel, border: `1px solid ${color}`, borderRadius: 10, padding: "12px 14px",
+            boxShadow: "0 12px 32px rgba(0,0,0,0.55)", animation: "pulse 1.6s ease-out 1",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+            <div>
+              <div style={{ fontFamily: DISP, fontSize: 13, fontWeight: 700, color }}>
+                {isNews ? `News · ${(a.topic || "market").toUpperCase()}` : `Unusual activity · ${a.symbol} (score ${a.score != null ? Math.round(a.score) : "—"})`}
+              </div>
+              <div style={{ fontFamily: DISP, fontSize: 12, color: T.fg, marginTop: 6, lineHeight: 1.4 }}>
+                {isNews ? a.headline : a.message}
+              </div>
+              <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginTop: 6 }}>
+                {isNews ? (a.reason || "AI flagged this as high impact for Nifty. Not advice.") : "Heads-up only — not a Nifty prediction. Disappears in a few seconds."}
+              </div>
+            </div>
+            <button
+              onClick={() => onDismiss(key)} aria-label="Dismiss"
+              style={{ background: "transparent", border: "none", color: T.muted, cursor: "pointer", fontSize: 16, lineHeight: 1, flexShrink: 0 }}
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const NEWS_SECTIONS = [
+  { id: "nifty", title: "Nifty 50", blurb: "India index — shown first" },
+  { id: "us", title: "USA markets", blurb: "S&P, Nasdaq, Fed" },
+  { id: "trump", title: "Trump / policy", blurb: "Tariffs, tweets" },
+  { id: "crude", title: "Other news", blurb: "Crude and leftover headlines" },
+];
+
+function sentimentColor(s) {
+  if (s === "bullish") return T.put;
+  if (s === "bearish") return T.call;
+  return T.muted;
+}
+
+function fmtTapePrice(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  return Math.abs(v) >= 1000 ? v.toLocaleString("en-IN", { maximumFractionDigits: 0 }) : v.toFixed(2);
+}
+
+function TapeChip({ label, quote }) {
+  const pct = quote?.pct_change;
+  const color = pct == null ? T.muted : pct >= 0 ? T.put : T.call;
+  const state = (quote?.market_state || "").toUpperCase();
+  const live = quote?.live || quote?.source === "upstox" || state === "REGULAR";
+  const closed = state === "CLOSED" || state === "POST" || state === "PRE";
+  const status = quote == null ? "" : live ? "live" : closed ? "last close" : "delayed";
+  return (
+    <div style={{ background: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 8px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 6, alignItems: "center" }}>
+        <div style={{ fontFamily: MONO, fontSize: 9, color: T.muted, letterSpacing: ".04em" }}>{label}</div>
+        {status && (
+          <div style={{ fontFamily: MONO, fontSize: 8, color: live ? T.put : T.muted, letterSpacing: ".04em" }}>{status}</div>
+        )}
+      </div>
+      <div style={{ fontFamily: MONO, fontSize: 13, fontWeight: 700, color: T.fg, marginTop: 2 }}>
+        {fmtTapePrice(quote?.price)}
+      </div>
+      <div style={{ fontFamily: MONO, fontSize: 12, fontWeight: 700, color, marginTop: 1 }}>
+        {pct == null ? "—" : `${pct >= 0 ? "+" : ""}${Number(pct).toFixed(2)}%`}
+      </div>
+    </div>
+  );
+}
+
+function NewsDesk({ news, loading, err, onRefresh, notifyPerm, onEnableNotify, collapsible, liveTape }) {
+  const [open, setOpen] = useState(!collapsible);
+  const sections = news?.sections || {};
+  const impact = news?.india_impact || {};
+  const tilt = impact.india_tilt_pct;
+  const tiltColor = tilt == null ? T.muted : tilt > 0 ? T.put : tilt < 0 ? T.call : T.amber;
+  const tape = liveTape || news?.tape || {};
+  const showBody = !collapsible || open;
+  return (
+    <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <div>
+          <div style={{ fontFamily: MONO, fontSize: 11, color: T.amber }}>NEWS DESK</div>
+          <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Top headlines</div>
+          <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginTop: 4 }}>
+            {loading ? "Updating…" : "Refreshes every 5 minutes"}
+            {news?.ai_pending ? " · scoring India impact…" : ""}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {collapsible && (
+            <button onClick={() => setOpen((v) => !v)}
+              style={{ background: T.panel2, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, cursor: "pointer", fontFamily: MONO }}>
+              {open ? "Hide" : "Show"}
+            </button>
+          )}
+          <button onClick={onRefresh} style={{ background: T.panel2, color: T.cyan, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, cursor: "pointer", fontFamily: MONO }}>
+            {loading ? "…" : "↻"}
+          </button>
+        </div>
+      </div>
+      {collapsible && !open && (
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+          <div style={{ fontFamily: MONO, fontSize: 22, fontWeight: 700, color: tiltColor }}>
+            {tilt == null ? "—" : `${tilt > 0 ? "+" : ""}${tilt}%`}
+          </div>
+          <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>{impact.label || "India tilt"} · tap Show for headlines</div>
+        </div>
+      )}
+      {showBody && (
+      <>
+      {notifyPerm !== "unsupported" && notifyPerm !== "granted" && (
+        <button
+          onClick={onEnableNotify}
+          style={{
+            marginTop: 10, width: "100%", background: T.panel2, color: T.fg, border: `1px solid ${T.amber}66`,
+            borderRadius: 8, padding: "8px 10px", fontSize: 12, cursor: "pointer", fontFamily: DISP, textAlign: "left",
+          }}
+        >
+          Allow short browser alerts for high-impact news
+        </button>
+      )}
+
+      <div style={{ marginTop: 12, background: T.panel2, border: `1px solid ${tiltColor}55`, borderRadius: 10, padding: 12 }}>
+        <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted, letterSpacing: ".06em" }}>IMPACT ON INDIA</div>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
+          <div style={{ fontFamily: MONO, fontSize: 28, fontWeight: 700, color: tiltColor, lineHeight: 1 }}>
+            {tilt == null ? "—" : `${tilt > 0 ? "+" : ""}${tilt}%`}
+          </div>
+          <div style={{ fontFamily: DISP, fontSize: 13, fontWeight: 600, color: tiltColor }}>{impact.label || "—"}</div>
+        </div>
+        <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginTop: 6 }}>
+          News tilt for Nifty (−100 bearish → +100 bullish)
+          {impact.headline_count ? ` · ${impact.bullish_headlines} up / ${impact.bearish_headlines} down` : ""}
+        </div>
+        <div style={{ fontFamily: DISP, fontSize: 12, color: T.fg, lineHeight: 1.4, marginTop: 8 }}>
+          {loading && !news ? "Reading headlines…" : (news?.pre_analysis || "No pre-read yet.")}
+        </div>
+        {news?.updated_at && (
+          <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted, marginTop: 8 }}>
+            {new Date(news.updated_at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })} IST
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 10 }}>
+        <TapeChip label="NIFTY" quote={tape.nifty} />
+        <TapeChip label="S&P" quote={tape.sp500} />
+        <TapeChip label="NASDAQ" quote={tape.nasdaq} />
+        <TapeChip label="BRENT" quote={tape.brent} />
+      </div>
+
+      {err && <div style={{ fontFamily: DISP, fontSize: 12, color: T.call, marginTop: 8 }}>{err}</div>}
+      {NEWS_SECTIONS.map((sec) => {
+        const items = sections[sec.id] || [];
+        return (
+          <div key={sec.id} style={{ marginTop: 14 }}>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>{sec.title}</div>
+            <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>{sec.blurb}</div>
+            {items.length === 0 && (
+              <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, marginTop: 6 }}>No fresh headline in this bucket.</div>
+            )}
+            {items.map((h, i) => {
+              const ip = h.india_pct;
+              const ic = ip > 0 ? T.put : ip < 0 ? T.call : T.muted;
+              return (
+              <a
+                key={`${sec.id}-${i}`}
+                href={h.link || undefined}
+                target="_blank"
+                rel="noreferrer"
+                style={{ display: "block", textDecoration: "none", marginTop: 8, paddingBottom: 8, borderBottom: `1px solid ${T.line}` }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
+                  <div style={{ fontFamily: DISP, fontSize: 13, color: T.fg, lineHeight: 1.4, minWidth: 0, flex: "1 1 160px" }}>{h.headline}</div>
+                  <div style={{
+                    flexShrink: 0, fontFamily: MONO, fontSize: 11, fontWeight: 700, color: ic,
+                    background: `${ic}18`, border: `1px solid ${ic}44`, borderRadius: 999, padding: "2px 7px",
+                  }}>
+                    India {ip > 0 ? "+" : ""}{ip ?? 0}%
+                  </div>
+                </div>
+                {h.reason && <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted, marginTop: 4 }}>{h.reason}</div>}
+              </a>
+              );
+            })}
+          </div>
+        );
+      })}
+      </>
+      )}
+    </div>
+  );
+}
+
+function Th({ children, hint }) {
+  return (
+    <th style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}`, fontWeight: 500, verticalAlign: "bottom" }}>
+      <div>{children}</div>
+      {hint && <div style={{ fontFamily: DISP, fontSize: 10, fontWeight: 400, color: T.muted, marginTop: 3, maxWidth: 110, lineHeight: 1.3 }}>{hint}</div>}
+    </th>
+  );
+}
+
+function ContributionAlertsView({ backendUrl }) {
+  const narrow = useNarrow(900);
+  const [snap, setSnap] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [backtest, setBacktest] = useState(null);
+  const [btErr, setBtErr] = useState("");
+  const [btLoading, setBtLoading] = useState(false);
+  const [btDays, setBtDays] = useState(15);
+  const [toasts, setToasts] = useState([]);
+  const [notifyPerm, setNotifyPerm] = useState(
+    typeof Notification === "undefined" ? "unsupported" : Notification.permission,
+  );
+  const seenAlertKeys = useRef(new Set());
+  const toastTimers = useRef({});
+  const [news, setNews] = useState(null);
+  const [newsErr, setNewsErr] = useState("");
+  const [newsLoading, setNewsLoading] = useState(false);
+  const [tape, setTape] = useState(null);
+  const status = marketStatus();
+
+  const dismissToast = useCallback((key) => {
+    setToasts((prev) => prev.filter((a) => toastKey(a) !== key));
+    if (toastTimers.current[key]) {
+      clearTimeout(toastTimers.current[key]);
+      delete toastTimers.current[key];
+    }
+  }, []);
+
+  const pushToasts = useCallback((incoming) => {
+    const fresh = [];
+    for (const a of incoming || []) {
+      const key = toastKey(a);
+      if (!(a.symbol || a.headline) || seenAlertKeys.current.has(key)) continue;
+      seenAlertKeys.current.add(key);
+      fresh.push(a);
+    }
+    if (!fresh.length) return;
+    setToasts((prev) => [...prev, ...fresh].slice(-4));
+    for (const a of fresh) {
+      fireBrowserNotification(a);
+      const key = toastKey(a);
+      toastTimers.current[key] = setTimeout(() => dismissToast(key), UNUSUAL_TOAST_MS);
+    }
+  }, [dismissToast]);
+
+  useEffect(() => () => {
+    Object.values(toastTimers.current).forEach(clearTimeout);
+  }, []);
+
+  useEffect(() => {
+    pushToasts(snap?.early_warning?.new_alerts);
+  }, [snap, pushToasts]);
+
+  const load = useCallback(async () => {
+    if (!backendUrl) return;
+    setLoading(true);
+    try {
+      const base = backendUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/index-engine/snapshot`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setSnap(json);
+      setErr(json.error || "");
+    } catch (e) {
+      setErr(e.message);
+    } finally { setLoading(false); }
+  }, [backendUrl]);
+
+  const loadNews = useCallback(async (force = false) => {
+    if (!backendUrl) return;
+    const base = backendUrl.replace(/\/$/, "");
+    const apply = (json) => {
+      setNews(json);
+      setNewsErr("");
+      if (json.tape) setTape(json.tape);
+      const hot = [];
+      for (const items of Object.values(json.sections || {})) {
+        for (const h of items || []) {
+          if (h.impact === "high") hot.push({ kind: "news", ...h });
+        }
+      }
+      pushToasts(hot);
+    };
+    setNewsLoading(true);
+    try {
+      // Headlines + tape first (no Gemini). Full scores fill in after.
+      const liteRes = await fetch(`${base}/api/index-engine/news?lite=true`);
+      if (liteRes.ok) apply(await liteRes.json());
+    } catch (e) {
+      setNewsErr(e.message);
+    }
+    try {
+      const qs = force ? "?force=true" : "";
+      const res = await fetch(`${base}/api/index-engine/news${qs}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      apply(await res.json());
+    } catch (e) {
+      setNewsErr(e.message);
+    } finally { setNewsLoading(false); }
+  }, [backendUrl, pushToasts]);
+
+  const loadTape = useCallback(async () => {
+    if (!backendUrl) return;
+    try {
+      const base = backendUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/index-engine/tape`);
+      if (!res.ok) return;
+      const json = await res.json();
+      if (json.tape) setTape(json.tape);
+    } catch { /* keep last quotes */ }
+  }, [backendUrl]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { loadNews(false); }, [loadNews]);
+  useEffect(() => { loadTape(); }, [loadTape]);
+  useEffect(() => {
+    const id = setInterval(() => loadNews(false), 5 * 60_000);
+    return () => clearInterval(id);
+  }, [loadNews]);
+  useEffect(() => {
+    const id = setInterval(loadTape, 20_000);
+    return () => clearInterval(id);
+  }, [loadTape]);
+
+  useEffect(() => {
+    if (!backendUrl || !status.open) return;
+    const sec = Math.max(5, snap?.config?.poll_seconds || 10);
+    const id = setInterval(load, sec * 1000);
+    return () => clearInterval(id);
+  }, [backendUrl, status.open, load, snap?.config?.poll_seconds]);
+
+  const runBacktest = async () => {
+    setBtLoading(true); setBtErr("");
+    try {
+      const base = backendUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/index-engine/backtest?days=${btDays}`);
+      const json = await res.json();
+      if (json.error) setBtErr(json.error);
+      setBacktest(json);
+    } catch (e) {
+      setBtErr(e.message);
+    } finally { setBtLoading(false); }
+  };
+
+  const attr = snap?.attribution;
+  const recon = attr?.reconciliation || {};
+  const movers = attr?.stocks || [];
+  const ew = snap?.early_warning;
+  const alerts = ew?.recent_alerts || ew?.new_alerts || [];
+  const scored = ew?.stocks || [];
+  const sweep = backtest?.threshold_sweep || [];
+  const mx = backtest?.metrics?.matrix;
+  const threshold = snap?.config?.alert_score_threshold ?? 78;
+  const liveTape = useMemo(() => {
+    const t = { ...(tape || news?.tape || {}) };
+    if (attr?.index_ltp != null && attr?.index_prev_close) {
+      const prev = attr.index_prev_close;
+      t.nifty = {
+        price: attr.index_ltp,
+        previous_close: prev,
+        pct_change: ((attr.index_ltp - prev) / prev) * 100,
+        source: "upstox",
+        live: true,
+        market_state: status.open ? "REGULAR" : "CLOSED",
+      };
+    }
+    return t;
+  }, [tape, news, attr, status.open]);
+
+  const urgencyColor = (s) => {
+    if (s == null) return T.muted;
+    if (s >= 78) return T.call;
+    if (s >= 60) return T.amber;
+    return T.cyan;
+  };
+
+  const urgencyLabel = (s) => {
+    if (s == null) return "no data yet";
+    if (s >= 78) return "unusual — would alert";
+    if (s >= 60) return "elevated";
+    return "quiet";
+  };
+
+  return (
+    <div style={{ marginTop: 14 }}>
+      <UnusualActivityToasts toasts={toasts} onDismiss={dismissToast} />
+      <div className="contrib-layout">
+        <aside className="news-aside">
+          <NewsDesk
+            news={news} loading={newsLoading} err={newsErr}
+            collapsible={narrow}
+            liveTape={liveTape}
+            onRefresh={() => loadNews(false)}
+            notifyPerm={notifyPerm}
+            onEnableNotify={async () => {
+              if (typeof Notification === "undefined") return;
+              const perm = await Notification.requestPermission();
+              setNotifyPerm(perm);
+            }}
+          />
+        </aside>
+        <div className="contrib-main">
+      <PcrOiCard backendUrl={backendUrl} />
+
+      <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginTop: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>1 · FACT</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Who dragged Nifty today</div>
+            <Hint>Green points pushed Nifty up. Pink points pulled it down. Sorted so the biggest influence is on top — even if that influence was negative.</Hint>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <Pill color={recon.data_stale ? T.amber : T.put}>
+              {recon.data_stale ? "prices look stale or incomplete" : "live prices ok"}
+            </Pill>
+            <button onClick={load} style={{ background: T.panel2, color: T.cyan, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontFamily: MONO }}>
+              {loading ? "…" : "↻"}
+            </button>
+          </div>
+        </div>
+        {!snap?.connected && (
+          <div style={{ fontFamily: DISP, fontSize: 13, color: T.amber, marginTop: 12, lineHeight: 1.45 }}>
+            Live stock prices need Upstox. Open <span style={{ fontFamily: MONO, color: T.cyan, overflowWrap: "anywhere" }}>http://127.0.0.1:8000/api/upstox/login</span> once, then refresh.
+            {err ? ` (${err})` : ""}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
+          <Stat label="Nifty now" value={fmt(attr?.index_ltp, 1)} sub={attr?.index_prev_close != null ? `yesterday close ${fmt(attr.index_prev_close, 1)}` : ""} />
+          <Stat label="Nifty today" value={fmtSigned(recon.actual_index_pts, 1)} color={(recon.actual_index_pts || 0) >= 0 ? T.put : T.call} sub="points since yesterday" />
+          <Stat label="From these 20 stocks" value={fmtSigned(recon.sum_contribution_pts, 1)} sub={`we only cover ${fmt(recon.coverage_pct, 1)}% of Nifty`} />
+          <Stat label="The other 30 stocks" value={fmtSigned(recon.unexplained_pts, 1)} color={recon.reconciliation_stale ? T.amber : T.muted} sub="leftover points we didn't assign" />
+        </div>
+        <Hint>
+          The leftover is normal — we only track the 20 heaviest names (~75% of Nifty), not all 50.
+          Worry only if leftover is huge <i>and</i> the badge says prices look stale.
+        </Hint>
+        <div style={{ overflowX: "auto", marginTop: 14 }}>
+          <table style={{ width: "100%", minWidth: 480, borderCollapse: "collapse", fontFamily: MONO, fontSize: 11 }}>
+            <thead>
+              <tr style={{ color: T.muted, textAlign: "left" }}>
+                <Th hint="Company">Stock</Th>
+                <Th hint="How big it is inside Nifty">Weight</Th>
+                <Th hint="Stock up/down today">Stock move</Th>
+                <Th hint="How many Nifty points this caused">Nifty points</Th>
+                <Th hint="Last traded price">Price</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {movers.map((s) => (
+                <tr key={s.symbol} style={{ color: s.quote_stale ? T.muted : T.fg }}>
+                  <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>
+                    <div style={{ fontFamily: DISP, fontWeight: 600 }}>{s.symbol}</div>
+                    <div style={{ color: T.muted, fontSize: 10 }}>{s.name}</div>
+                  </td>
+                  <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>{fmt(s.weight_pct, 1)}%</td>
+                  <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: (s.pct_change || 0) >= 0 ? T.put : T.call }}>{fmtSigned(s.pct_change, 2)}%</td>
+                  <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: (s.contribution_pts || 0) >= 0 ? T.put : T.call, fontWeight: 600 }}>{fmtSigned(s.contribution_pts, 2)}</td>
+                  <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>{fmt(s.ltp, 2)}</td>
+                </tr>
+              ))}
+              {!movers.length && (
+                <tr><td colSpan={5} style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>Connect Upstox to see which stocks moved Nifty.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ background: T.panel, border: `1px solid ${T.amber}55`, borderRadius: 14, padding: 16, marginTop: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: T.amber }}>2 · HEADS-UP  ·  not a prediction</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Unusual activity in heavy stocks</div>
+            <Hint>
+              Each stock gets a 0–100 “busy” score from volume spikes, options/futures OI (if available),
+              price stretching away from the day’s average (VWAP), and buy vs sell pressure.
+              An alert only appears if the score reaches <b style={{ color: T.fg }}>{threshold}</b> — that bar is set high so you are not flooded.
+              Empty feed = the system thinks nothing unusual is going on. That is OK.
+            </Hint>
+          </div>
+          <Pill color={T.amber}>alert if score ≥ {threshold}</Pill>
+        </div>
+        {notifyPerm !== "unsupported" && notifyPerm !== "granted" && (
+          <button
+            onClick={async () => {
+              if (typeof Notification === "undefined") return;
+              const perm = await Notification.requestPermission();
+              setNotifyPerm(perm);
+            }}
+            style={{
+              marginTop: 12, background: T.panel2, color: T.fg, border: `1px solid ${T.call}66`,
+              borderRadius: 8, padding: "8px 12px", fontSize: 12, cursor: "pointer", fontFamily: DISP,
+            }}
+          >
+            Allow browser pop-up alerts (they vanish after a few seconds)
+          </button>
+        )}
+        {notifyPerm === "granted" && (
+          <Hint>Browser alerts are on. A pink pop-up will flash for ~8 seconds when a heavy stock looks unusual — it will not sit on this page.</Hint>
+        )}
+
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>Recent heads-ups</div>
+          <Hint>These are a quiet log only. The pink alert is a short pop-up (and a browser notification if you allowed it), not a card that stays here.</Hint>
+          {alerts.length === 0 && (
+            <div style={{ fontFamily: DISP, fontSize: 13, color: T.muted, marginTop: 10, padding: 12, background: T.panel2, borderRadius: 8, border: `1px dashed ${T.line}` }}>
+              None so far this session. Quiet is the default.
+            </div>
+          )}
+          {alerts.slice(0, 8).map((a, i) => (
+            <div key={`${a.fired_at}-${a.symbol}-${i}`} style={{
+              borderBottom: `1px solid ${T.line}`, padding: "8px 0",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                <div style={{ fontFamily: DISP, fontSize: 13, color: T.fg }}>{a.symbol} · score {fmt(a.score, 0)}</div>
+                <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted }}>{a.fired_at ? new Date(a.fired_at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }) : ""} IST</div>
+              </div>
+              <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, marginTop: 4, lineHeight: 1.4 }}>{a.message}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 14, fontWeight: 700, marginTop: 16, marginBottom: 4 }}>Busy-ness of each heavy stock</div>
+        <Hint>Higher score = more unusual vs that stock’s own recent tape. Colour: quiet (teal), elevated (amber), would-alert (pink).</Hint>
+        <div style={{ overflowX: "auto", marginTop: 8 }}>
+          <table style={{ width: "100%", minWidth: 520, borderCollapse: "collapse", fontFamily: MONO, fontSize: 11 }}>
+            <thead>
+              <tr style={{ color: T.muted, textAlign: "left" }}>
+                <Th>Stock</Th>
+                <Th hint="0 quiet → 100 extreme">Busy score</Th>
+                <Th hint="1 = normal volume, 3 = 3× usual">Volume</Th>
+                <Th hint="Open interest change; often blank for stocks">OI</Th>
+                <Th hint="Price vs today’s volume-average">Vs VWAP</Th>
+                <Th hint="+ buyers, − sellers">Buy/sell</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {scored.map((s) => (
+                <tr key={s.symbol}>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{s.symbol}</td>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88`, color: urgencyColor(s.score), fontWeight: 700 }}>
+                    {fmt(s.score, 0)}
+                    <div style={{ fontFamily: DISP, fontSize: 10, fontWeight: 400, color: T.muted }}>{urgencyLabel(s.score)}</div>
+                  </td>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{s.volume_surge == null ? "—" : `${fmt(s.volume_surge, 1)}×`}</td>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{fmtSigned(s.oi_change_pct, 1)}{s.oi_change_pct == null ? "" : "%"}</td>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{fmtSigned(s.vwap_dev_pct, 2)}{s.vwap_dev_pct == null ? "" : "%"}</td>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{fmtSigned(s.imbalance, 2)}</td>
+                </tr>
+              ))}
+              {!scored.length && (
+                <tr><td colSpan={6} style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>No scores until Upstox is connected.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginTop: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: T.muted }}>3 · REPORT CARD</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Did the heads-up work on old days?</div>
+            <Hint>
+              This does not trade. It asks: on past days, when a heavy stock looked this busy, did Nifty move at least about 40 points in the next 15 minutes?
+              Use this before you trust Section 2. You can skip it while learning the two tables above.
+            </Hint>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>Look back</span>
+            <input type="number" min={5} max={60} value={btDays} onChange={(e) => setBtDays(+e.target.value)}
+              style={{ width: 56, background: T.ink, border: `1px solid ${T.line}`, color: T.fg, borderRadius: 8, padding: "6px 8px", fontFamily: MONO, fontSize: 12 }} />
+            <span style={{ fontFamily: DISP, fontSize: 12, color: T.muted }}>days</span>
+            <button onClick={runBacktest} disabled={btLoading}
+              style={{ background: T.cyan, color: T.ink, border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 600, cursor: "pointer", fontSize: 12 }}>
+              {btLoading ? "Checking…" : "Run check"}
+            </button>
+          </div>
+        </div>
+        {btErr && <div style={{ fontFamily: DISP, fontSize: 13, color: T.call, marginTop: 8 }}>{btErr}</div>}
+        {backtest?.metrics && (
+          <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
+            <Stat label="When it beeped, Nifty really moved" value={backtest.metrics.precision_pct != null ? `${backtest.metrics.precision_pct}%` : "—"} color={T.cyan} sub="precision — higher = fewer false alarms" />
+            <Stat label="Big Nifty moves we had already flagged" value={backtest.metrics.recall_pct != null ? `${backtest.metrics.recall_pct}%` : "—"} color={T.amber} sub="recall — higher = fewer missed moves" />
+            <Stat label="Heads-ups in this sample" value={backtest.metrics.alert_count} sub={`busy-score bar ${backtest.metrics.score_threshold}`} />
+          </div>
+        )}
+        {mx && (
+          <div style={{ marginTop: 12, fontFamily: DISP, fontSize: 13, color: T.muted, lineHeight: 1.55 }}>
+            Simple count: alarm + Nifty moved = {mx.predicted_alert?.actual_move};
+            alarm + Nifty did nothing = {mx.predicted_alert?.no_move};
+            no alarm + Nifty moved anyway = {mx.no_alert?.actual_move};
+            quiet + Nifty quiet = {mx.no_alert?.no_move}.
+          </div>
+        )}
+        {sweep.length > 1 && (
+          <>
+            <Hint>Chart: if we make the alarm harder to trigger (threshold →), false alarms usually fall (teal) but we miss more real moves (amber).</Hint>
+            <div style={{ height: 240, marginTop: 8 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={sweep} margin={{ top: 8, right: 12, bottom: 4, left: -8 }}>
+                  <CartesianGrid stroke={T.line} strokeDasharray="2 4" vertical={false} />
+                  <XAxis dataKey="threshold" tick={{ fill: T.muted, fontSize: 10, fontFamily: MONO }} axisLine={{ stroke: T.line }} tickLine={false} />
+                  <YAxis domain={[0, 100]} tick={{ fill: T.muted, fontSize: 10, fontFamily: MONO }} axisLine={false} tickLine={false} width={36} />
+                  <Tooltip contentStyle={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, fontFamily: MONO, fontSize: 11 }} />
+                  <Line type="monotone" dataKey="precision_pct" name="beeped and Nifty moved %" stroke={T.cyan} strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="recall_pct" name="big moves we caught %" stroke={T.amber} strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </>
+        )}
+      </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  const narrow = useNarrow(900);
+  const [view, setView] = useState("pcr");
   const [symbol, setSymbol] = useState("NIFTY");
   const [metric, setMetric] = useState("oi");
   const [data, setData] = useState(null);
@@ -1633,27 +2644,40 @@ export default function App() {
   };
 
   return (
-    <div style={{ background: T.ink, minHeight: "100vh", color: T.fg, fontFamily: DISP, padding: 14 }}>
+    <div style={{ background: T.ink, minHeight: "100vh", color: T.fg, fontFamily: DISP, padding: "14px 14px calc(18px + env(safe-area-inset-bottom))" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
         * { box-sizing: border-box; }
-        input, button { font-family: inherit; }
+        input, button, select { font-family: inherit; }
+        img { max-width: 100%; }
+        .contrib-layout { display: flex; gap: 14px; align-items: flex-start; }
+        .news-aside { flex: 0 0 340px; width: 340px; max-width: 100%; position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; -webkit-overflow-scrolling: touch; }
+        .contrib-main { flex: 1 1 560px; min-width: 0; }
+        @media (max-width: 900px) {
+          .contrib-layout { flex-direction: column; }
+          .news-aside { flex: none; width: 100%; position: static; max-height: none; overflow: visible; }
+          .pcr-hero { font-size: 36px !important; }
+          .spot-scroll { height: 220px !important; }
+          .ua-toasts { top: auto !important; bottom: calc(12px + env(safe-area-inset-bottom)); left: 8px; right: 8px; width: auto !important; max-width: none !important; }
+          input, select, textarea { font-size: 16px !important; }
+          button { min-height: 40px; }
+        }
       `}</style>
 
-      <div style={{ maxWidth: 760, margin: "0 auto" }}>
+      <div style={{ maxWidth: view === "contribution" ? 1280 : 760, margin: "0 auto", width: "100%" }}>
 
         {/* header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
           <div>
             <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: "-.01em" }}>
-              PCR <span style={{ color: T.cyan }}>Session Clock</span>
+              {view === "contribution" ? <>Index <span style={{ color: T.cyan }}>Contribution</span></> : <>PCR <span style={{ color: T.cyan }}>Session Clock</span></>}
             </div>
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.muted, marginTop: 1 }}>
-              Intraday Put-Call Ratio · NSE indices
+              {view === "contribution" ? "Who moved Nifty today, plus a heads-up if a heavy stock looks unusually busy" : "Intraday Put-Call Ratio · NSE indices"}
             </div>
           </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <Pill color={status.open ? T.put : T.muted} dot={status.open}>{status.label}</Pill>
             <a href="./premarket.html"
               style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, textDecoration: "none" }}>
@@ -1690,8 +2714,26 @@ export default function App() {
           </div>
         )}
 
-        {/* symbol tabs */}
         <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
+          {[["pcr", narrow ? "PCR" : "PCR Clock"], ["contribution", narrow ? "Alerts" : "Contribution & Alerts"]].map(([id, lbl]) => (
+            <button key={id} onClick={() => setView(id)}
+              style={{
+                flex: 1, padding: "9px 4px", borderRadius: 8, cursor: "pointer", fontFamily: MONO, fontSize: 12, fontWeight: 600,
+                background: view === id ? T.cyan : T.panel, color: view === id ? T.ink : T.muted,
+                border: `1px solid ${view === id ? T.cyan : T.line}`,
+              }}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+
+        {view === "contribution" ? (
+          <ContributionAlertsView backendUrl={backendUrl} />
+        ) : (
+        <>
+
+        {/* symbol tabs */}
+        <div style={{ display: "flex", gap: 6, marginTop: 14, overflowX: "auto" }}>
           {SYMBOLS.map((s) => (
             <button key={s} onClick={() => setSymbol(s)}
               style={{
@@ -1714,7 +2756,7 @@ export default function App() {
               <div style={{ fontFamily: DISP, fontSize: 10, letterSpacing: ".12em", textTransform: "uppercase", color: T.muted }}>
                 Current PCR ({metric === "oi" ? "OI" : "Volume"})
               </div>
-              <div style={{ fontFamily: MONO, fontSize: 48, fontWeight: 600, lineHeight: 1, color: T.fg }}>
+              <div className="pcr-hero" style={{ fontFamily: MONO, fontSize: 48, fontWeight: 600, lineHeight: 1, color: T.fg }}>
                 {fmt(curVal)}
               </div>
             </div>
@@ -1728,7 +2770,7 @@ export default function App() {
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 16, marginTop: 16, paddingTop: 14, borderTop: `1px solid ${T.line}` }}>
+          <div style={{ display: "flex", gap: 16, marginTop: 16, paddingTop: 14, borderTop: `1px solid ${T.line}`, flexWrap: "wrap" }}>
             <Stat label="Put OI" value={fmtOi(cur.putOi)} color={T.put} />
             <Stat label="Call OI" value={fmtOi(cur.callOi)} color={T.call} />
             <Stat label="Snapshots" value={snaps.length} sub={data?.expiry || ""} />
@@ -1736,7 +2778,7 @@ export default function App() {
         </div>
 
         {/* metric toggle */}
-        <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
+        <div style={{ display: "flex", gap: 6, marginTop: 12, flexWrap: "wrap" }}>
           {[["oi", "PCR · Open Interest"], ["vol", "PCR · Volume"]].map(([k, lbl]) => (
             <button key={k} onClick={() => setMetric(k)}
               style={{
@@ -1792,6 +2834,8 @@ export default function App() {
           PCR &gt; 1 = more puts open (often read as hedged / defensive positioning); PCR &lt; 1 = more calls.
           Interpretation is contextual — extremes are frequently read contrarian. Not investment advice.
         </div>
+        </>
+        )}
       </div>
     </div>
   );

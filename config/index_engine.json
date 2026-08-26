@@ -1,0 +1,36 @@
+{
+  "poll_seconds": 10,
+  "persist_seconds": 60,
+  "candle_interval": "5minute",
+  "candle_refresh_seconds": 60,
+  "stale_quote_seconds": 180,
+  "tracking_error_flag_pts": 25,
+  "attribution": {
+    "comment": "contribution_pts = ((ltp - prev_close) / prev_close) * (weight_pct / 100) * index_prev_close. Equivalent to the spec formula with index_divisor_constant = index_prev_close / 100 when weight_pct is in percent units."
+  },
+  "early_warning": {
+    "disclaimer": "Probability signal, not a prediction. Tune weights against the backtest, not live guessing.",
+    "score_weights": {
+      "volume": 0.40,
+      "oi": 0.20,
+      "vwap": 0.25,
+      "imbalance": 0.15
+    },
+    "alert_score_threshold": 78,
+    "min_weight_pct_to_alert": 1.4,
+    "cooldown_minutes": 45,
+    "volume_avg_periods": 20,
+    "volume_surge_full_score": 4.0,
+    "oi_lookback_bars": 3,
+    "oi_change_full_score_pct": 8.0,
+    "vwap_dev_full_score_pct": 1.5,
+    "imbalance_full_score": 0.55
+  },
+  "backtest": {
+    "lookahead_minutes": 15,
+    "move_threshold_pts": 40,
+    "exclude_open_times": ["09:15", "09:20", "09:25", "09:30", "09:35"],
+    "default_days": 15,
+    "threshold_sweep": [55, 60, 65, 70, 75, 78, 80, 85, 90]
+  }
+}

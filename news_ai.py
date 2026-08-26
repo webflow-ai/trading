@@ -143,7 +143,12 @@ def _parse_rss_items(xml_text: str, source: str) -> list[dict]:
                     published = published.replace(tzinfo=dt.timezone.utc)
             except (TypeError, ValueError):
                 published = None
-        items.append({"headline": title_el.text.strip(), "published": published, "source": source})
+        items.append({
+            "headline": title_el.text.strip(),
+            "published": published,
+            "source": source,
+            "link": (item.findtext("link") or "").strip() or None,
+        })
     return items
 
 
@@ -239,6 +244,7 @@ def _parse_classifier_json(text: str) -> dict:
     return {
         "items": data.get("items", []),
         "overall_sentiment": data.get("overall_sentiment", ""),
+        "pre_analysis": data.get("pre_analysis") or "",
         "note": None,
     }
 
@@ -348,3 +354,374 @@ async def get_news_brief(now: dt.datetime | None = None) -> dict:
         "headlines": select_top_market_moving(classified["items"]),
         "news_sentiment": classified["overall_sentiment"],
     }
+
+
+# ---------------- Live desk (US / crude / Trump / Nifty) ----------------
+# Separate from the morning-brief RSS list: topic-specific Google News RSS
+# plus the existing India market feeds. Cached a few minutes so the
+# Contribution page can poll without a Gemini round-trip every time.
+
+LIVE_NEWS_FEEDS = {
+    "nifty": [
+        "https://news.google.com/rss/search?q=Nifty+50+OR+Sensex+OR+NSE+India+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://www.moneycontrol.com/rss/marketreports.xml",
+        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    ],
+    "us": [
+        "https://news.google.com/rss/search?q=US+stock+market+OR+Nasdaq+OR+S%26P+500+OR+Federal+Reserve+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+    ],
+    "trump": [
+        "https://news.google.com/rss/search?q=Trump+tariff+OR+Trump+Fed+OR+Trump+India+OR+Trump+tweet+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+    ],
+    "crude": [
+        "https://news.google.com/rss/search?q=crude+oil+OR+Brent+OR+WTI+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+    ],
+}
+
+# Display + fetch fill order. Crude is the leftover / "other" bucket.
+TOPIC_PRIORITY = ("nifty", "us", "trump", "crude")
+LIVE_PER_TOPIC = {"nifty": 6, "us": 4, "trump": 3, "crude": 3}
+
+TOPIC_KEYWORDS = {
+    "nifty": ("nifty", "sensex", "nse ", "bse ", "fii", "dii", "rbi", "gift nifty"),
+    "us": ("federal reserve", "powell", "s&p", "nasdaq", "dow ", "wall street", "us stocks", "treasury yield", "fomc"),
+    "trump": ("trump", "tariff", "white house", "maga"),
+    "crude": ("crude", "brent", "wti", "opec", "oil price", "oil prices"),
+}
+
+LIVE_PROMPT_TEMPLATE = """You are a desk analyst for Indian Nifty 50 traders.
+Each headline has a suggested topic in this priority: nifty, us, trump, crude (other).
+Prefer tagging Nifty 50 / India market news as nifty when the headline is about Indian equities.
+
+For each headline classify Nifty impact (not US-only impact):
+- sentiment: bullish|bearish|neutral for Nifty
+- impact: high|medium|low (high only if it could actually move the Indian session)
+- topic: us|crude|trump|nifty|other
+- reason: 8 words or fewer
+
+Then write pre_analysis: ONE short sentence (max 22 words) on impact for the Indian / Nifty session only. No buy/sell advice.
+
+Respond with ONLY valid JSON, no markdown:
+{{"items":[{{"headline":"...","sentiment":"bullish|bearish|neutral","impact":"high|medium|low","topic":"us|crude|trump|nifty|other","reason":"..."}}],"pre_analysis":"..."}}
+
+Headlines:
+{headlines_block}
+"""
+
+LIVE_CACHE_SECONDS = 300  # 5 minutes — matches the dashboard poll
+TAPE_CACHE_SECONDS = 20  # quotes are cheap; do not freeze them with news AI
+_live_cache: dict = {"at": 0.0, "payload": None}
+_tape_cache: dict = {"at": 0.0, "payload": None}
+
+IMPACT_WEIGHT = {"high": 3, "medium": 2, "low": 1}
+HEADLINE_INDIA_PCT = {"high": 80, "medium": 45, "low": 20}
+
+
+def shorten_pre_analysis(text: str, max_chars: int = 140) -> str:
+    """Keep the pre-read to one short line for the left rail."""
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return ""
+    for sep in (". ", "! ", "? "):
+        if sep in cleaned:
+            cleaned = cleaned.split(sep, 1)[0].rstrip(".!?") + "."
+            break
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 1].rsplit(" ", 1)[0] + "…"
+    return cleaned
+
+
+def india_pct_for_item(sentiment: str | None, impact: str | None) -> int:
+    mag = HEADLINE_INDIA_PCT.get((impact or "low").lower(), 20)
+    s = (sentiment or "neutral").lower()
+    if s == "bullish":
+        return mag
+    if s == "bearish":
+        return -mag
+    return 0
+
+
+def summarize_india_impact(sections: dict) -> dict:
+    """Net news tilt for India: −100 (bearish) to +100 (bullish)."""
+    items = [it for rows in (sections or {}).values() for it in (rows or [])]
+    signed = weight = 0
+    n_bull = n_bear = 0
+    for it in items:
+        w = IMPACT_WEIGHT.get(str(it.get("impact", "low")).lower(), 1)
+        s = str(it.get("sentiment", "neutral")).lower()
+        if s == "bullish":
+            signed += w
+            n_bull += 1
+        elif s == "bearish":
+            signed -= w
+            n_bear += 1
+        weight += w
+    tilt = round(100 * signed / weight) if weight else 0
+    if tilt >= 25:
+        label = "Positive for India"
+    elif tilt <= -25:
+        label = "Negative for India"
+    elif tilt >= 8:
+        label = "Mildly positive"
+    elif tilt <= -8:
+        label = "Mildly negative"
+    else:
+        label = "Mixed for India"
+    return {
+        "india_tilt_pct": tilt,
+        "label": label,
+        "bullish_headlines": n_bull,
+        "bearish_headlines": n_bear,
+        "headline_count": len(items),
+    }
+
+
+def _topic_cap(topic: str) -> int:
+    return int(LIVE_PER_TOPIC.get(topic, 3))
+
+
+def infer_topic(headline: str, suggested: str | None = None) -> str:
+    text = (headline or "").lower()
+    for topic, keys in TOPIC_KEYWORDS.items():
+        if any(k in text for k in keys):
+            return topic
+    if suggested in TOPIC_KEYWORDS or suggested in ("us", "crude", "trump", "nifty"):
+        return suggested
+    return "other"
+
+
+def _live_prompt(rows: list[dict]) -> str:
+    block = "\n".join(
+        f"{i + 1}. [{r.get('topic') or 'other'}] {r['headline']}"
+        for i, r in enumerate(rows)
+    )
+    return LIVE_PROMPT_TEMPLATE.format(headlines_block=block)
+
+
+async def _classify_live(rows: list[dict], client: httpx.AsyncClient) -> dict:
+    if not rows:
+        return {"items": [], "pre_analysis": "No headlines available.", "note": None}
+    prompt = _live_prompt(rows)
+    errors = []
+    if GEMINI_API_KEY:
+        try:
+            resp = await client.post(
+                GEMINI_API_URL.format(model=GEMINI_MODEL),
+                params={"key": GEMINI_API_KEY},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            candidate = (data.get("candidates") or [{}])[0]
+            parts = (candidate.get("content") or {}).get("parts") or []
+            text = parts[0]["text"] if parts else ""
+            parsed = _parse_classifier_json(text)
+            return {
+                "items": parsed.get("items") or [],
+                "pre_analysis": (parsed.get("pre_analysis") or parsed.get("overall_sentiment") or "").strip(),
+                "note": None,
+            }
+        except Exception as e:
+            print(f"news_ai: live Gemini failed: {e}")
+            errors.append(f"Gemini: {e}")
+    else:
+        errors.append("GEMINI_API_KEY not configured")
+
+    if OPENROUTER_API_KEY:
+        try:
+            resp = await client.post(
+                OPENROUTER_API_URL,
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}]},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            text = (choice.get("message") or {}).get("content") or ""
+            parsed = _parse_classifier_json(text)
+            return {
+                "items": parsed.get("items") or [],
+                "pre_analysis": (parsed.get("pre_analysis") or parsed.get("overall_sentiment") or "").strip(),
+                "note": "; ".join(errors + [f"used OpenRouter ({OPENROUTER_MODEL})"]),
+            }
+        except Exception as e:
+            print(f"news_ai: live OpenRouter failed: {e}")
+            errors.append(f"OpenRouter: {e}")
+    else:
+        errors.append("OPENROUTER_API_KEY not configured")
+
+    return {
+        "items": [{"headline": r["headline"], "sentiment": "neutral", "impact": "low", "topic": r.get("topic"), "reason": "unavailable"} for r in rows],
+        "pre_analysis": "AI pre-read is unavailable right now. Headlines below are raw feeds — treat them as unfiltered.",
+        "note": "; ".join(errors),
+    }
+
+
+def merge_live_classification(raw_rows: list[dict], classified: dict) -> dict:
+    by_h = {}
+    for it in classified.get("items") or []:
+        key = (it.get("headline") or "").strip().lower()
+        if key:
+            by_h[key] = it
+    sections = {t: [] for t in TOPIC_PRIORITY}
+    for r in raw_rows:
+        hit = by_h.get(r["headline"].strip().lower(), {})
+        topic = infer_topic(r["headline"], hit.get("topic") or r.get("topic"))
+        if topic not in sections:
+            topic = r.get("topic") if r.get("topic") in sections else "crude"
+        item = {
+            "headline": r["headline"],
+            "source": r.get("source"),
+            "link": r.get("link"),
+            "published": r["published"].isoformat() if isinstance(r.get("published"), dt.datetime) else r.get("published"),
+            "topic": topic,
+            "sentiment": hit.get("sentiment") or "neutral",
+            "impact": hit.get("impact") or "low",
+            "reason": hit.get("reason") or "",
+            "india_pct": india_pct_for_item(hit.get("sentiment") or "neutral", hit.get("impact") or "low"),
+        }
+        if len(sections[topic]) < _topic_cap(topic):
+            sections[topic].append(item)
+    return {
+        "sections": sections,
+        "pre_analysis": shorten_pre_analysis(classified.get("pre_analysis") or ""),
+        "india_impact": summarize_india_impact(sections),
+        "note": classified.get("note"),
+    }
+
+
+async def fetch_live_topic_headlines(now: dt.datetime | None = None) -> list[dict]:
+    now = now or dt.datetime.now(dt.timezone.utc)
+    # Short timeout: one slow Google News feed must not stall the whole desk.
+    async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        tasks = []
+        meta = []
+        for topic, urls in LIVE_NEWS_FEEDS.items():
+            for url in urls:
+                tasks.append(fetch_rss_headlines(client, url, topic))
+                meta.append(topic)
+        groups = await asyncio.gather(*tasks)
+    rows = []
+    for topic, group in zip(meta, groups):
+        for it in group:
+            it = {**it, "topic": infer_topic(it["headline"], topic)}
+            rows.append(it)
+    recent = _within_window(rows, now, hours=24)
+    recent.sort(key=lambda it: it["published"] or now, reverse=True)
+    # Fill in priority order: Nifty 50, US, Trump, then other (crude).
+    buckets = {t: [] for t in TOPIC_PRIORITY}
+    for it in _dedupe(recent):
+        t = it.get("topic") if it.get("topic") in buckets else "crude"
+        it["topic"] = t
+        if len(buckets[t]) < _topic_cap(t):
+            buckets[t].append(it)
+    picked = []
+    for t in TOPIC_PRIORITY:
+        picked.extend(buckets[t])
+    return picked
+
+
+def _rows_sig(rows: list[dict]) -> tuple:
+    return tuple(sorted((r.get("headline") or "").strip().lower() for r in rows))
+
+
+async def _fetch_tape() -> dict:
+    try:
+        import market_data
+        tape = await market_data.fetch_quotes(["^NSEI", "^GSPC", "^IXIC", "BZ=F"])
+        return {
+            "nifty": tape.get("^NSEI"),
+            "sp500": tape.get("^GSPC"),
+            "nasdaq": tape.get("^IXIC"),
+            "brent": tape.get("BZ=F"),
+        }
+    except Exception as e:
+        print(f"news_ai: live tape quotes failed: {e}")
+        return {}
+
+
+async def get_live_tape(force: bool = False) -> dict:
+    """Yahoo last prices, cached ~20s so the chips can tick without Gemini."""
+    now_m = time.monotonic()
+    cached = _tape_cache.get("payload")
+    if cached and not force and now_m - _tape_cache["at"] < TAPE_CACHE_SECONDS:
+        return cached
+    tape = await _fetch_tape()
+    payload = {
+        "tape": tape,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "refresh_seconds": TAPE_CACHE_SECONDS,
+    }
+    _tape_cache["at"] = now_m
+    _tape_cache["payload"] = payload
+    return payload
+
+
+def _stamp(payload: dict, *, ai_pending: bool, stale: bool = False) -> dict:
+    payload["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload["refresh_seconds"] = LIVE_CACHE_SECONDS
+    payload["ai_pending"] = ai_pending
+    payload["stale"] = stale
+    return payload
+
+
+async def _assemble(rows: list[dict], tape: dict, classified: dict | None, *, ai_pending: bool) -> dict:
+    classified = classified or {
+        "items": [],
+        "pre_analysis": "Scoring India impact…",
+        "note": None,
+    }
+    payload = merge_live_classification(rows, classified)
+    payload["tape"] = tape or {}
+    return _stamp(payload, ai_pending=ai_pending)
+
+
+async def get_live_news_desk(force: bool = False, lite: bool = False) -> dict:
+    """Headlines are cheap (RSS + Yahoo). Gemini is the slow part (~15–25s).
+
+    lite=True: RSS + tape only, reuse last AI scores if the headline set
+    matches. The UI should call this first so the rail fills in seconds.
+
+    Full call: returns a fresh cache if young; otherwise reuses last payload
+    (stale-while-revalidate) unless force=True, which waits for a full rebuild.
+    """
+    now_m = time.monotonic()
+    cached = _live_cache.get("payload")
+    if cached and not force and not lite and now_m - _live_cache["at"] < LIVE_CACHE_SECONDS:
+        return cached
+
+    try:
+        rows, tape_pack = await asyncio.gather(fetch_live_topic_headlines(), get_live_tape())
+        tape = tape_pack.get("tape") or {}
+        sig = _rows_sig(rows)
+        classified = _live_cache.get("classified") if _live_cache.get("sig") == sig else None
+
+        if lite:
+            payload = await _assemble(rows, tape, classified, ai_pending=classified is None)
+            if classified is None and cached:
+                # Keep previous India % / pre-read until the full pass finishes
+                payload["pre_analysis"] = cached.get("pre_analysis") or payload["pre_analysis"]
+                payload["india_impact"] = cached.get("india_impact") or payload["india_impact"]
+            return payload
+
+        if classified is None:
+            async with httpx.AsyncClient(timeout=35) as client:
+                classified = await _classify_live(rows, client)
+
+        payload = await _assemble(rows, tape, classified, ai_pending=False)
+        _live_cache["at"] = now_m
+        _live_cache["payload"] = payload
+        _live_cache["classified"] = classified
+        _live_cache["sig"] = sig
+        return payload
+    except Exception as e:
+        print(f"news_ai: get_live_news_desk failed: {e}")
+        if cached:
+            return {**cached, "stale": True, "note": str(e)}
+        return _stamp({
+            "sections": {t: [] for t in TOPIC_PRIORITY},
+            "pre_analysis": "News desk failed to load.",
+            "india_impact": summarize_india_impact({}),
+            "tape": {},
+            "note": str(e),
+        }, ai_pending=False)

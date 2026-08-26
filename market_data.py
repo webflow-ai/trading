@@ -18,6 +18,7 @@ in the HTML; and the live price field there is called last_trade_price,
 not lastPrice.
 """
 
+import asyncio
 import datetime as dt
 import json
 import re
@@ -92,13 +93,26 @@ async def fetch_quote(client: httpx.AsyncClient, yf_symbol: str) -> dict | None:
         meta = result.get("meta") or {}
         price = meta.get("regularMarketPrice")
         previous_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        closes = [c for c in (quote.get("close") or []) if c is not None]
+        if previous_close is None and len(closes) >= 2:
+            previous_close = closes[-2]
+        if price is None and closes:
+            price = closes[-1]
         if price is None or not previous_close:
             return None
         pct_change = (price - previous_close) / previous_close * 100
+        as_of = None
+        ts = meta.get("regularMarketTime")
+        if isinstance(ts, (int, float)):
+            as_of = dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat()
         return {
             "price": round(price, 4),
             "previous_close": round(previous_close, 4),
             "pct_change": round(pct_change, 4),
+            "market_state": meta.get("marketState") or None,
+            "as_of": as_of,
+            "source": "yahoo",
         }
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
         print(f"market_data: quote fetch failed for {yf_symbol}: {e}")
@@ -111,7 +125,8 @@ async def fetch_quotes(symbols: list[str]) -> dict:
     key is present even on failure so callers can tell 'fetched, flat' apart
     from 'unavailable'."""
     async with httpx.AsyncClient(timeout=15) as client:
-        return {symbol: await fetch_quote(client, symbol) for symbol in symbols}
+        quotes = await asyncio.gather(*[fetch_quote(client, symbol) for symbol in symbols])
+        return dict(zip(symbols, quotes))
 
 
 NEXT_DATA_RE = re.compile(r'__NEXT_DATA__"\s*type="application/json">(.*?)</script>', re.DOTALL)

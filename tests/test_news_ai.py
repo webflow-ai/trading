@@ -331,3 +331,86 @@ def test_get_news_brief_trims_to_top_news_count(monkeypatch):
 
     result = asyncio.run(news_ai.get_news_brief())
     assert len(result["headlines"]) == news_ai.TOP_NEWS_COUNT
+
+
+def test_infer_topic_from_keywords_and_suggested():
+    assert news_ai.infer_topic("Trump tariff threat hits exporters") == "trump"
+    assert news_ai.infer_topic("Brent crude jumps $3") == "crude"
+    assert news_ai.infer_topic("Nasdaq futures slide after Fed") == "us"
+    assert news_ai.infer_topic("Nifty 50 closes at record") == "nifty"
+    assert news_ai.infer_topic("Random company earnings", suggested="us") == "us"
+
+
+def test_merge_live_classification_buckets_and_keeps_pre_analysis():
+    now = dt.datetime(2026, 8, 26, 10, 0, tzinfo=dt.timezone.utc)
+    raw = [
+        {"headline": "Brent crude jumps", "source": "crude", "link": "http://x", "published": now, "topic": "crude"},
+        {"headline": "Nifty 50 opens higher", "source": "nifty", "link": None, "published": now, "topic": "nifty"},
+    ]
+    classified = {
+        "items": [
+            {"headline": "Brent crude jumps", "sentiment": "bearish", "impact": "high", "topic": "crude", "reason": "oil shock"},
+            {"headline": "Nifty 50 opens higher", "sentiment": "bullish", "impact": "medium", "topic": "nifty", "reason": "gap up"},
+        ],
+        "pre_analysis": "Oil is the risk; Nifty opened firm.",
+        "note": None,
+    }
+    out = news_ai.merge_live_classification(raw, classified)
+    assert list(out["sections"].keys()) == list(news_ai.TOPIC_PRIORITY)
+    assert list(news_ai.TOPIC_PRIORITY) == ["nifty", "us", "trump", "crude"]
+    assert out["pre_analysis"].startswith("Oil")
+    assert out["sections"]["crude"][0]["sentiment"] == "bearish"
+    assert out["sections"]["crude"][0]["india_pct"] == -80
+    assert out["india_impact"]["india_tilt_pct"] < 0
+    assert out["india_impact"]["label"]
+    assert out["sections"]["crude"][0]["impact"] == "high"
+    assert out["sections"]["nifty"][0]["headline"] == "Nifty 50 opens higher"
+
+
+def test_shorten_pre_analysis_keeps_one_short_line():
+    long = "First sentence is the only one we want. Second sentence should drop. Third too."
+    assert news_ai.shorten_pre_analysis(long) == "First sentence is the only one we want."
+    assert len(news_ai.shorten_pre_analysis("x" * 400)) <= 140
+
+
+def test_summarize_india_impact_net_percentage():
+    sections = {
+        "us": [{"sentiment": "bearish", "impact": "high"}],
+        "nifty": [{"sentiment": "bullish", "impact": "low"}],
+    }
+    out = news_ai.summarize_india_impact(sections)
+    assert out["india_tilt_pct"] < 0
+    assert out["bearish_headlines"] == 1
+    assert out["bullish_headlines"] == 1
+    parsed = news_ai._parse_classifier_json('{"items":[],"pre_analysis":"Watch crude.","overall_sentiment":"x"}')
+    assert parsed["pre_analysis"] == "Watch crude."
+
+
+def test_index_engine_news_endpoint(monkeypatch):
+    from fastapi.testclient import TestClient
+    import api.index as index_module
+
+    async def fake_desk(force=False, lite=False):
+        return {"sections": {"us": [], "crude": [], "trump": [], "nifty": []}, "pre_analysis": "Quiet.", "updated_at": "now", "lite": lite}
+
+    monkeypatch.setattr(news_ai, "get_live_news_desk", fake_desk)
+    client = TestClient(index_module.app)
+    r = client.get("/api/index-engine/news")
+    assert r.status_code == 200
+    assert r.json()["pre_analysis"] == "Quiet."
+    lite = client.get("/api/index-engine/news", params={"lite": "true"})
+    assert lite.json()["lite"] is True
+
+
+def test_index_engine_tape_endpoint(monkeypatch):
+    from fastapi.testclient import TestClient
+    import api.index as index_module
+
+    async def fake_tape(force=False):
+        return {"tape": {"nifty": {"pct_change": 0.2, "price": 25000}}, "refresh_seconds": 20}
+
+    monkeypatch.setattr(news_ai, "get_live_tape", fake_tape)
+    client = TestClient(index_module.app)
+    r = client.get("/api/index-engine/tape")
+    assert r.status_code == 200
+    assert r.json()["tape"]["nifty"]["price"] == 25000

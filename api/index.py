@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
@@ -2022,6 +2022,77 @@ async def candles(symbol: str = Query("NIFTY"), interval: str = Query("5m"),
     except Exception as e:
         print(f"candles fetch failed for {symbol}: {e}")
         return {"symbol": symbol, "candles": []}
+
+
+# ---------------- Index contribution + early-warning (separate engines) ----------------
+# Live quotes still come from Upstox (same session as /api/upstox/movers).
+# Math lives in index_attribution.py / index_early_warning.py / index_backtest.py
+# so this file only wires HTTP + token handling.
+
+import index_engine  # noqa: E402  — after load_dotenv, same as other local modules
+import storage as index_engine_storage  # noqa: E402
+
+
+@app.get("/api/index-engine/constituents")
+async def index_engine_constituents():
+    return index_engine.load_constituents()
+
+
+@app.get("/api/index-engine/config")
+async def index_engine_config_get():
+    return index_engine.get_config()
+
+
+@app.put("/api/index-engine/config")
+async def index_engine_config_put(overlay: dict = Body(...)):
+    """Runtime overlay merged on top of config/index_engine.json + env.
+    Serverless cold starts forget in-memory overlay — persist by editing
+    the JSON file (or env vars) for a durable change."""
+    return index_engine.set_runtime_overlay(overlay)
+
+
+@app.get("/api/index-engine/snapshot")
+async def index_engine_snapshot(persist: bool = Query(True)):
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "error": "Upstox not connected — visit /api/upstox/login"}
+    result = await index_engine.build_snapshot(token, persist=persist)
+    if result.get("status_code") == 401:
+        await clear_upstox_token()
+        result.pop("status_code", None)
+    return result
+
+
+@app.get("/api/index-engine/alerts")
+async def index_engine_alerts(days: int = Query(14)):
+    rows = await index_engine_storage.get_index_engine_alerts(days=days)
+    return {"alerts": rows, "recent": index_engine._recent_alerts[:40]}
+
+
+@app.get("/api/index-engine/backtest")
+async def index_engine_backtest(days: int | None = Query(None)):
+    """Heavy: 21 parallel Upstox historical-candle calls. Trigger from the
+    dashboard button, never on a poll interval."""
+    token = await load_upstox_token()
+    if not token:
+        return {"connected": False, "error": "Upstox not connected — visit /api/upstox/login"}
+    return await index_engine.run_backtest(token, days=days)
+
+
+@app.get("/api/index-engine/news")
+async def index_engine_news(force: bool = Query(False), lite: bool = Query(False)):
+    """US / crude / Trump / Nifty headlines plus an AI pre-read.
+    lite=1 skips Gemini so the rail can paint in a few seconds; the
+    dashboard then calls again without lite for scores. Cached 5 minutes."""
+    import news_ai
+    return await news_ai.get_live_news_desk(force=force, lite=lite)
+
+
+@app.get("/api/index-engine/tape")
+async def index_engine_tape():
+    """Nifty / S&P / Nasdaq / Brent last quotes. Cached ~20s, not 5 minutes."""
+    import news_ai
+    return await news_ai.get_live_tape()
 
 
 @app.get("/api/health")

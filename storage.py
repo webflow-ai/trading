@@ -321,3 +321,91 @@ async def get_movers_snapshots(days: int = 30) -> list[dict]:
     callers that want one-per-day (e.g. accuracy scoring) reduce client-side,
     same as get_participant_history()'s convention above."""
     return await _select("movers_snapshots", order="captured_at.desc", limit=str(days * 50))
+
+
+# ---------------- index contribution / early-warning engine ----------------
+
+async def _insert_returning(table: str, rows: list[dict] | dict) -> list[dict]:
+    if not configured():
+        print(f"storage: SUPABASE_URL/SUPABASE_SERVICE_KEY not set, skipping insert into {table}")
+        return []
+    client = await get_client()
+    headers = _headers()
+    headers["Prefer"] = "return=representation"
+    resp = await client.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, json=rows)
+    resp.raise_for_status()
+    return resp.json() or []
+
+
+async def _patch(table: str, match: dict, body: dict) -> list[dict]:
+    if not configured():
+        print(f"storage: SUPABASE_URL/SUPABASE_SERVICE_KEY not set, skipping patch of {table}")
+        return []
+    client = await get_client()
+    headers = _headers()
+    headers["Prefer"] = "return=representation"
+    resp = await client.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}", params=match, headers=headers, json=body,
+    )
+    resp.raise_for_status()
+    return resp.json() or []
+
+
+async def save_index_engine_ticks(rows: list[dict]) -> None:
+    if not rows:
+        return
+    await _insert("index_engine_ticks", rows)
+
+
+async def save_index_engine_candles(rows: list[dict]) -> None:
+    if not rows:
+        return
+    await _upsert("index_engine_candles", rows, on_conflict="symbol,interval,bar_ts")
+
+
+async def save_index_engine_alert(alert: dict) -> dict:
+    """Insert one early-warning alert. Subsequent 5/15/30m moves are filled
+    in later by update_index_engine_alert — that follow-up is what makes
+    live accuracy measurable."""
+    payload = {
+        "fired_at": alert.get("fired_at"),
+        "trade_date": alert.get("trade_date"),
+        "symbol": alert.get("symbol"),
+        "name": alert.get("name"),
+        "weight_pct": alert.get("weight_pct"),
+        "score": alert.get("score"),
+        "reasons": alert.get("reasons"),
+        "message": alert.get("message"),
+        "potential_index_pts": alert.get("potential_index_pts"),
+        "features": alert.get("features"),
+        "index_ltp_at_fire": alert.get("index_ltp_at_fire"),
+        "stock_ltp_at_fire": alert.get("stock_ltp_at_fire"),
+    }
+    rows = await _insert_returning("index_engine_alerts", payload)
+    saved = rows[0] if rows else {**payload, "id": None}
+    if saved.get("id") is not None:
+        alert["id"] = saved["id"]
+    return saved
+
+
+async def update_index_engine_alert(alert_id: int, patch: dict) -> dict | None:
+    rows = await _patch("index_engine_alerts", {"id": f"eq.{alert_id}"}, patch)
+    return rows[0] if rows else None
+
+
+async def get_open_index_engine_alerts(limit: int = 80) -> list[dict]:
+    """Alerts still missing the 30-minute subsequent-move fill."""
+    return await _select(
+        "index_engine_alerts",
+        index_move_30m="is.null",
+        order="fired_at.desc",
+        limit=str(limit),
+    )
+
+
+async def get_index_engine_alerts(days: int = 14) -> list[dict]:
+    return await _select(
+        "index_engine_alerts",
+        order="fired_at.desc",
+        limit=str(max(days * 40, 50)),
+    )

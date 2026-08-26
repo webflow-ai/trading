@@ -668,7 +668,7 @@ function ParticipantPanel({ brief, livePositioning, liveScore, positioningUpdate
             return (
               <div key={p} style={{
                 display: "grid",
-                gridTemplateColumns: "64px 72px 1fr auto",
+                gridTemplateColumns: "minmax(48px,auto) minmax(64px,auto) 1fr auto",
                 alignItems: "center", gap: 8,
                 padding: "8px 10px", borderRadius: 8,
                 background: p === "FII" ? `${biasColor}10` : T.panel2,
@@ -975,13 +975,14 @@ function StockDetailModal({ symbol, name, ltp, pctChange, points, onClose }) {
       style={{
         position: "fixed", inset: 0, background: "rgba(10,15,30,0.75)", zIndex: 1000,
         display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
+        paddingBottom: "max(16px, env(safe-area-inset-bottom))",
       }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
           background: T.panel, border: `1px solid ${T.line}`, borderRadius: 12, padding: 20,
-          width: "100%", maxWidth: 900, height: "85vh", display: "flex", flexDirection: "column",
+          width: "100%", maxWidth: 900, maxHeight: "85vh", height: "min(85vh, 900px)", display: "flex", flexDirection: "column",
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12, flexShrink: 0 }}>
@@ -3069,8 +3070,15 @@ export default function App() {
   }, [loadBrief, loadHistoryAndTrend, loadGift, loadPositioning, loadLiveScore]);
 
   return (
-    <div style={{ minHeight: "100%", background: T.ink, fontFamily: DISP }}>
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "24px 16px 48px" }}>
+    <div style={{ minHeight: "100%", background: T.ink, fontFamily: DISP, overflowX: "clip" }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        @media (max-width: 900px) {
+          input, select, textarea { font-size: 16px !important; }
+          button { min-height: 40px; }
+        }
+      `}</style>
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "16px 12px calc(32px + env(safe-area-inset-bottom))", width: "100%" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
           <div style={{ fontSize: 20, fontWeight: 700, color: T.fg }}>Nifty Pre-Market Brief</div>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -3108,7 +3116,7 @@ export default function App() {
           </div>
         )}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 16 }}>
           <VerdictCard
             brief={brief} liveGift={liveGift} liveScore={liveScore}
             showHistory={showHistory} onToggleHistory={() => setShowHistory((s) => !s)}

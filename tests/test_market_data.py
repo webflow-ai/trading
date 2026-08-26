@@ -76,6 +76,22 @@ def test_fetch_quote_computes_pct_change():
     assert result["pct_change"] == round((42500.5 - 42000.0) / 42000.0 * 100, 4)
 
 
+def test_fetch_quote_falls_back_to_daily_closes():
+    json_data = {
+        "chart": {
+            "result": [{
+                "meta": {"regularMarketPrice": 80.0, "marketState": "REGULAR", "regularMarketTime": 1700000000},
+                "indicators": {"quote": [{"close": [70.0, 72.0, 80.0]}]},
+            }],
+        },
+    }
+    client = FakeAsyncClient(FakeResponse(json_data=json_data))
+    result = asyncio.run(market_data.fetch_quote(client, "BZ=F"))
+    assert result["previous_close"] == 72.0
+    assert result["source"] == "yahoo"
+    assert result["market_state"] == "REGULAR"
+
+
 def test_fetch_quote_returns_none_when_previous_close_missing():
     json_data = {"chart": {"result": [{"meta": {"regularMarketPrice": 100.0}}]}}
     client = FakeAsyncClient(FakeResponse(json_data=json_data))

@@ -1,0 +1,28 @@
+{
+  "index": "NIFTY",
+  "as_of": "2026-06-30",
+  "source": "NSE Nifty 50 factsheet (quarterly). Re-check nseindia.com after each index review — weights drift.",
+  "note": "Top 20 by free-float weight, typically ~75-80% of Nifty 50. ff_mcap_crore is approximate and for display only; contribution uses weight_pct.",
+  "constituents": [
+    {"symbol": "HDFCBANK", "name": "HDFC Bank", "isin": "INE040A01034", "weight_pct": 13.0, "ff_mcap_crore": 1500000},
+    {"symbol": "ICICIBANK", "name": "ICICI Bank", "isin": "INE090A01021", "weight_pct": 8.7, "ff_mcap_crore": 1000000},
+    {"symbol": "RELIANCE", "name": "Reliance Industries", "isin": "INE002A01018", "weight_pct": 8.5, "ff_mcap_crore": 980000},
+    {"symbol": "INFY", "name": "Infosys", "isin": "INE009A01021", "weight_pct": 5.7, "ff_mcap_crore": 660000},
+    {"symbol": "ITC", "name": "ITC", "isin": "INE154A01025", "weight_pct": 4.3, "ff_mcap_crore": 500000},
+    {"symbol": "TCS", "name": "Tata Consultancy Services", "isin": "INE467B01029", "weight_pct": 4.0, "ff_mcap_crore": 460000},
+    {"symbol": "LT", "name": "Larsen & Toubro", "isin": "INE018A01030", "weight_pct": 3.9, "ff_mcap_crore": 450000},
+    {"symbol": "BHARTIARTL", "name": "Bharti Airtel", "isin": "INE397D01024", "weight_pct": 3.8, "ff_mcap_crore": 440000},
+    {"symbol": "AXISBANK", "name": "Axis Bank", "isin": "INE238A01034", "weight_pct": 3.3, "ff_mcap_crore": 380000},
+    {"symbol": "SBIN", "name": "State Bank of India", "isin": "INE062A01020", "weight_pct": 3.2, "ff_mcap_crore": 370000},
+    {"symbol": "KOTAKBANK", "name": "Kotak Mahindra Bank", "isin": "INE237A01036", "weight_pct": 3.0, "ff_mcap_crore": 350000},
+    {"symbol": "BAJFINANCE", "name": "Bajaj Finance", "isin": "INE296A01032", "weight_pct": 2.4, "ff_mcap_crore": 280000},
+    {"symbol": "HINDUNILVR", "name": "Hindustan Unilever", "isin": "INE030A01027", "weight_pct": 2.2, "ff_mcap_crore": 250000},
+    {"symbol": "M&M", "name": "Mahindra & Mahindra", "isin": "INE101A01026", "weight_pct": 1.9, "ff_mcap_crore": 220000},
+    {"symbol": "SUNPHARMA", "name": "Sun Pharmaceutical", "isin": "INE044A01036", "weight_pct": 1.7, "ff_mcap_crore": 200000},
+    {"symbol": "HCLTECH", "name": "HCL Technologies", "isin": "INE860A01027", "weight_pct": 1.6, "ff_mcap_crore": 185000},
+    {"symbol": "MARUTI", "name": "Maruti Suzuki", "isin": "INE585B01010", "weight_pct": 1.5, "ff_mcap_crore": 175000},
+    {"symbol": "NTPC", "name": "NTPC", "isin": "INE733E01010", "weight_pct": 1.5, "ff_mcap_crore": 175000},
+    {"symbol": "TITAN", "name": "Titan Company", "isin": "INE280A01028", "weight_pct": 1.4, "ff_mcap_crore": 160000},
+    {"symbol": "TMPV", "name": "Tata Motors Passenger Vehicles", "isin": "INE155A01022", "weight_pct": 1.4, "ff_mcap_crore": 160000}
+  ]
+}

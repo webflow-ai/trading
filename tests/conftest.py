@@ -19,6 +19,19 @@ def no_real_redis(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def reset_index_engine_state():
+    import index_engine
+    index_engine.reset_runtime_overlay()
+    index_engine._last_alert_at.clear()
+    index_engine._recent_alerts.clear()
+    index_engine._candle_cache["series"] = {}
+    index_engine._candle_cache["at"] = 0.0
+    index_engine._last_persist_at = 0.0
+    yield
+    index_engine.reset_runtime_overlay()
+
+
+@pytest.fixture(autouse=True)
 def clear_in_memory_caches():
     """The module-level caches persist across tests otherwise (they're
     plain dicts on the module, not reset between test functions)."""
