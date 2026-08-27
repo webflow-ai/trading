@@ -1,0 +1,17 @@
+{
+  "id": "/",
+  "name": "PCR Session Clock",
+  "short_name": "PCR Clock",
+  "description": "Nifty PCR, contribution, and unusual-activity alerts.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0A0F1E",
+  "theme_color": "#0A0F1E",
+  "lang": "en-IN",
+  "icons": [
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

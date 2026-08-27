@@ -1035,6 +1035,124 @@ function Pill({ children, color, dot }) {
     </span>
   );
 }
+function isIosDevice() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  return /iPhone|iPad|iPod/i.test(ua)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+function isIosChrome() {
+  return isIosDevice() && /CriOS/i.test(navigator.userAgent || "");
+}
+function isStandalonePwa() {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia("(display-mode: standalone)").matches
+    || window.navigator.standalone === true;
+}
+
+function IosInstallSheet({ onClose }) {
+  const chrome = isIosChrome();
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 80, background: "rgba(6,10,22,.72)",
+        display: "flex", alignItems: "flex-end", justifyContent: "center", padding: 16,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(420px, 100%)", background: T.panel, border: `1px solid ${T.line}`,
+          borderRadius: 16, padding: 16, color: T.fg, fontFamily: DISP,
+        }}
+      >
+        <div style={{ fontSize: 16, fontWeight: 700 }}>Add to iPhone Home Screen</div>
+        <div style={{ fontSize: 13, color: T.muted, marginTop: 6, lineHeight: 1.45 }}>
+          Chrome on iPhone cannot install this app. Use <b style={{ color: T.fg }}>Safari</b>.
+          Alerts work on iOS 16.4+ after it is on the Home Screen, then opened from that icon.
+        </div>
+        {chrome && (
+          <div style={{ marginTop: 10, fontSize: 13, color: T.amber, lineHeight: 1.4 }}>
+            You are in Chrome. Tap the share menu → Open in Safari, then follow the steps below.
+          </div>
+        )}
+        <ol style={{ margin: "12px 0 0", paddingLeft: 18, fontSize: 13, lineHeight: 1.55, color: T.fg }}>
+          <li>Open this page in Safari.</li>
+          <li>Tap the Share button (square with an arrow).</li>
+          <li>Scroll and tap <b>Add to Home Screen</b>.</li>
+          <li>Tap Add. Open <b>PCR Clock</b> from the new icon.</li>
+          <li>Tap Allow when asked for alerts.</li>
+        </ol>
+        <button
+          onClick={onClose}
+          style={{
+            marginTop: 14, width: "100%", background: T.cyan, color: T.ink, border: "none",
+            borderRadius: 10, padding: "10px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer",
+          }}
+        >
+          Got it
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function InstallAppButton() {
+  const [promptEvt, setPromptEvt] = useState(null);
+  const [sheet, setSheet] = useState(false);
+  const [installed, setInstalled] = useState(() => isStandalonePwa());
+  useEffect(() => {
+    const onPrompt = (e) => { e.preventDefault(); setPromptEvt(e); };
+    const onInstalled = () => { setPromptEvt(null); setInstalled(true); };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+  if (installed) return <Pill color={T.put}>App</Pill>;
+  const ios = isIosDevice();
+  const insecure = typeof window !== "undefined" && !window.isSecureContext
+    && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1";
+  const onClick = async () => {
+    if (ios) {
+      setSheet(true);
+      return;
+    }
+    if (promptEvt) {
+      promptEvt.prompt();
+      const choice = await promptEvt.userChoice.catch(() => null);
+      if (choice?.outcome === "accepted") setPromptEvt(null);
+      return;
+    }
+    const hint = insecure
+      ? "Chrome only offers Add to Home screen on HTTPS (or localhost). Open this PC URL on the phone via a secure tunnel, or on desktop: Chrome menu → Cast, save, and share → Install PCR Clock…"
+      : "Chrome menu (⋮) → Cast, save, and share → Install PCR Clock…  (or on Android: Add to Home screen)";
+    window.alert(hint);
+  };
+  return (
+    <>
+      <button onClick={onClick}
+        title={ios ? "Add to iPhone Home Screen" : "Install as a Chrome app"}
+        style={{ background: T.panel, color: T.cyan, border: `1px solid ${T.cyan}66`, borderRadius: 8, padding: "6px 10px", fontSize: 12, cursor: "pointer" }}>
+        {ios ? "Add to iPhone" : (promptEvt ? "Add to Chrome" : "Install app")}
+      </button>
+      {sheet && <IosInstallSheet onClose={() => setSheet(false)} />}
+    </>
+  );
+}
+
+async function requestNotifyPermission(setNotifyPerm) {
+  if (typeof Notification === "undefined") return;
+  if (isIosDevice() && !isStandalonePwa()) {
+    window.alert("On iPhone: open this page in Safari → Share → Add to Home Screen. Then open PCR Clock from the Home Screen icon and tap Allow for alerts.");
+    return;
+  }
+  const perm = await Notification.requestPermission();
+  setNotifyPerm(perm);
+}
 function Stat({ label, value, sub, color }) {
   return (
     <div style={{ flex: "1 1 140px", minWidth: 140 }}>
@@ -1997,19 +2115,30 @@ function toastKey(a) {
 function fireBrowserNotification(alert) {
   if (typeof Notification === "undefined") return;
   if (Notification.permission !== "granted") return;
+  const isNews = alert.kind === "news";
+  const title = isNews ? `News · ${(alert.topic || "market").toUpperCase()}` : `${alert.symbol} — unusual activity`;
+  const body = isNews
+    ? (alert.headline || "High-impact headline")
+    : (alert.message || "A heavy Nifty stock looks unusually busy. Not a prediction.");
+  const tag = toastKey(alert);
+  const payload = { type: "notify", title, body, tag, url: "./index.html" };
   try {
-    const isNews = alert.kind === "news";
-    const n = new Notification(
-      isNews ? `News · ${(alert.topic || "market").toUpperCase()}` : `${alert.symbol} — unusual activity`,
-      {
-        body: isNews
-          ? (alert.headline || "High-impact headline")
-          : (alert.message || "A heavy Nifty stock looks unusually busy. Not a prediction."),
-        tag: toastKey(alert),
-        requireInteraction: false,
-      },
-    );
-    setTimeout(() => { try { n.close(); } catch { /* already closed */ } }, UNUSUAL_TOAST_MS);
+    if (navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.controller.postMessage(payload);
+      return;
+    }
+    navigator.serviceWorker?.ready.then((reg) => {
+      if (reg.active) reg.active.postMessage(payload);
+      else if (reg.showNotification) {
+        reg.showNotification(title, { body, tag, icon: "./icons/icon-192.png" });
+      }
+    }).catch(() => {
+      new Notification(title, { body, tag, requireInteraction: false });
+    });
+    if (!navigator.serviceWorker) {
+      const n = new Notification(title, { body, tag, requireInteraction: false });
+      setTimeout(() => { try { n.close(); } catch { /* already closed */ } }, UNUSUAL_TOAST_MS);
+    }
   } catch { /* blocked / insecure context */ }
 }
 
@@ -2456,6 +2585,15 @@ function ContributionAlertsView({ backendUrl }) {
   return (
     <div style={{ marginTop: 14 }}>
       <UnusualActivityToasts toasts={toasts} onDismiss={dismissToast} />
+      {isIosDevice() && !isStandalonePwa() && (
+        <div style={{
+          marginBottom: 12, padding: "10px 12px", background: T.panel2, border: `1px solid ${T.cyan}44`,
+          borderRadius: 10, fontSize: 12, color: T.muted, lineHeight: 1.45, fontFamily: DISP,
+        }}>
+          iPhone: open in <b style={{ color: T.fg }}>Safari</b> → Share → <b style={{ color: T.fg }}>Add to Home Screen</b>.
+          Chrome cannot install it. Alerts work after you launch the Home Screen icon (iOS 16.4+).
+        </div>
+      )}
       <div className="contrib-layout">
         <aside className="news-aside">
           <NewsDesk
@@ -2464,11 +2602,7 @@ function ContributionAlertsView({ backendUrl }) {
             liveTape={liveTape}
             onRefresh={() => loadNews(false)}
             notifyPerm={notifyPerm}
-            onEnableNotify={async () => {
-              if (typeof Notification === "undefined") return;
-              const perm = await Notification.requestPermission();
-              setNotifyPerm(perm);
-            }}
+            onEnableNotify={() => requestNotifyPermission(setNotifyPerm)}
           />
         </aside>
         <div className="contrib-main">
@@ -2602,11 +2736,7 @@ function ContributionAlertsView({ backendUrl }) {
         </div>
         {notifyPerm !== "unsupported" && notifyPerm !== "granted" && (
           <button
-            onClick={async () => {
-              if (typeof Notification === "undefined") return;
-              const perm = await Notification.requestPermission();
-              setNotifyPerm(perm);
-            }}
+            onClick={() => requestNotifyPermission(setNotifyPerm)}
             style={{
               marginTop: 12, width: narrow ? "100%" : "auto", background: T.panel2, color: T.fg, border: `1px solid ${T.call}66`,
               borderRadius: 8, padding: "8px 12px", fontSize: 12, cursor: "pointer", fontFamily: DISP,
@@ -2942,6 +3072,7 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <Pill color={status.open ? T.put : T.muted} dot={status.open}>{status.label}</Pill>
+            <InstallAppButton />
             <a href="./premarket.html"
               style={{ background: T.panel, color: T.fg, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 12, textDecoration: "none" }}>
               Pre-Market Brief →
