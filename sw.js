@@ -1,6 +1,15 @@
 /* PCR Clock service worker — installable PWA + OS notifications. */
-const CACHE = "pcr-clock-v1";
-const PRECACHE = ["./index.html", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png"];
+const CACHE = "pcr-clock-v2";
+const PRECACHE = [
+  "./index.html",
+  "./manifest.webmanifest",
+  "./icons/favicon.ico",
+  "./icons/favicon-16x16.png",
+  "./icons/favicon-32x32.png",
+  "./icons/apple-touch-icon.png",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

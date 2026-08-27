@@ -3062,12 +3062,16 @@ export default function App() {
 
         {/* header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-          <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+            <img src="./icons/apple-touch-icon.png" alt="C34 Exchange" width={40} height={40}
+              style={{ borderRadius: 10, flex: "none", display: "block" }} />
+            <div>
             <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: "-.01em" }}>
               {view === "contribution" ? <>Index <span style={{ color: T.cyan }}>Contribution</span></> : <>PCR <span style={{ color: T.cyan }}>Session Clock</span></>}
             </div>
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.muted, marginTop: 1 }}>
               {view === "contribution" ? "Who moved Nifty today, plus a heads-up if a heavy stock looks unusually busy" : "Intraday Put-Call Ratio · NSE indices"}
+            </div>
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>

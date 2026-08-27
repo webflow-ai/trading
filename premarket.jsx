@@ -3080,7 +3080,11 @@ export default function App() {
       `}</style>
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "16px 12px calc(32px + env(safe-area-inset-bottom))", width: "100%" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
-          <div style={{ fontSize: 20, fontWeight: 700, color: T.fg }}>Nifty Pre-Market Brief</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+            <img src="./icons/apple-touch-icon.png" alt="C34 Exchange" width={40} height={40}
+              style={{ borderRadius: 10, flex: "none", display: "block" }} />
+            <div style={{ fontSize: 20, fontWeight: 700, color: T.fg }}>Nifty Pre-Market Brief</div>
+          </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             {loading && <span style={{ fontSize: 12, color: T.muted }}>Loading…</span>}
             {scoreUpdatedAt && (
