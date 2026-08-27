@@ -2378,10 +2378,22 @@ function ContributionAlertsView({ backendUrl }) {
 
   const attr = snap?.attribution;
   const recon = attr?.reconciliation || {};
-  const movers = attr?.stocks || [];
+  const movers = useMemo(() => {
+    const rows = [...(attr?.stocks || [])];
+    rows.sort((a, b) => {
+      const aa = a.contribution_pts == null ? -1 : Math.abs(a.contribution_pts);
+      const bb = b.contribution_pts == null ? -1 : Math.abs(b.contribution_pts);
+      return bb - aa;
+    });
+    return rows.slice(0, 5);
+  }, [attr?.stocks]);
   const ew = snap?.early_warning;
   const alerts = ew?.recent_alerts || ew?.new_alerts || [];
-  const scored = ew?.stocks || [];
+  const scored = useMemo(() => {
+    const rows = [...(ew?.stocks || [])];
+    rows.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+    return rows.slice(0, 5);
+  }, [ew?.stocks]);
   const sweep = backtest?.threshold_sweep || [];
   const mx = backtest?.metrics?.matrix;
   const threshold = snap?.config?.alert_score_threshold ?? 78;
@@ -2440,11 +2452,11 @@ function ContributionAlertsView({ backendUrl }) {
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
           <div style={{ minWidth: 0, flex: "1 1 200px" }}>
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.cyan }}>1 · FACT</div>
-            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Who dragged Nifty today</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Top 5 dragging Nifty now</div>
             <Hint>
               {narrow
-                ? "Green = pushed Nifty up. Pink = pulled it down. Biggest influence on top."
-                : "Green points pushed Nifty up. Pink points pulled it down. Sorted so the biggest influence is on top — even if that influence was negative."}
+                ? "Live ranking — the 5 names with the biggest Nifty point impact right now. Green = up, pink = down."
+                : "Live ranking of the 5 heaviest names by |Nifty points| right now. The list reshuffles as prices move. Green = pushed Nifty up, pink = pulled it down."}
             </Hint>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -2465,7 +2477,7 @@ function ContributionAlertsView({ backendUrl }) {
         <StatGrid>
           <Stat label="Nifty now" value={fmt(attr?.index_ltp, 1)} sub={attr?.index_prev_close != null ? `yesterday close ${fmt(attr.index_prev_close, 1)}` : ""} />
           <Stat label="Nifty today" value={fmtSigned(recon.actual_index_pts, 1)} color={(recon.actual_index_pts || 0) >= 0 ? T.put : T.call} sub="points since yesterday" />
-          <Stat label={narrow ? "From top 20" : "From these 20 stocks"} value={fmtSigned(recon.sum_contribution_pts, 1)} sub={`we only cover ${fmt(recon.coverage_pct, 1)}% of Nifty`} />
+          <Stat label={narrow ? "From top 20" : "From the tracked 20"} value={fmtSigned(recon.sum_contribution_pts, 1)} sub={`list below is the live top 5 · cover ${fmt(recon.coverage_pct, 1)}%`} />
           <Stat label={narrow ? "Other 30" : "The other 30 stocks"} value={fmtSigned(recon.unexplained_pts, 1)} color={recon.reconciliation_stale ? T.amber : T.muted} sub="leftover points we didn't assign" />
         </StatGrid>
         <Hint>
@@ -2475,14 +2487,14 @@ function ContributionAlertsView({ backendUrl }) {
         </Hint>
         {narrow ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
-            {movers.map((s) => (
+            {movers.map((s, i) => (
               <div key={s.symbol} style={{
                 background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 12px",
                 color: s.quote_stale ? T.muted : T.fg,
               }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontFamily: DISP, fontWeight: 700 }}>{s.symbol}</div>
+                    <div style={{ fontFamily: DISP, fontWeight: 700 }}>{i + 1}. {s.symbol}</div>
                     <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>{s.name}</div>
                   </div>
                   <div style={{
@@ -2517,6 +2529,7 @@ function ContributionAlertsView({ backendUrl }) {
           <table style={{ width: "100%", minWidth: 480, borderCollapse: "collapse", fontFamily: MONO, fontSize: 11 }}>
             <thead>
               <tr style={{ color: T.muted, textAlign: "left" }}>
+                <Th>#</Th>
                 <Th hint="Company">Stock</Th>
                 <Th hint="How big it is inside Nifty">Weight</Th>
                 <Th hint="Stock up/down today">Stock move</Th>
@@ -2525,8 +2538,9 @@ function ContributionAlertsView({ backendUrl }) {
               </tr>
             </thead>
             <tbody>
-              {movers.map((s) => (
+              {movers.map((s, i) => (
                 <tr key={s.symbol} style={{ color: s.quote_stale ? T.muted : T.fg }}>
+                  <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: T.muted }}>{i + 1}</td>
                   <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>
                     <div style={{ fontFamily: DISP, fontWeight: 600 }}>{s.symbol}</div>
                     <div style={{ color: T.muted, fontSize: 10 }}>{s.name}</div>
@@ -2538,7 +2552,7 @@ function ContributionAlertsView({ backendUrl }) {
                 </tr>
               ))}
               {!movers.length && (
-                <tr><td colSpan={5} style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>Connect Upstox to see which stocks moved Nifty.</td></tr>
+                <tr><td colSpan={6} style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>Connect Upstox to see which stocks moved Nifty.</td></tr>
               )}
             </tbody>
           </table>
@@ -2550,15 +2564,13 @@ function ContributionAlertsView({ backendUrl }) {
         <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
           <div style={{ minWidth: 0, flex: "1 1 200px" }}>
             <div style={{ fontFamily: MONO, fontSize: 11, color: T.amber }}>2 · HEADS-UP{narrow ? "" : "  ·  not a prediction"}</div>
-            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Unusual activity in heavy stocks</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Top 5 unusual heavy stocks</div>
             <Hint>
               {narrow
-                ? <>Busy score 0–100. Alert only if score ≥ <b style={{ color: T.fg }}>{threshold}</b>. Empty feed = quiet — that is OK.</>
+                ? <>Live ranking by busy score. Alert only if score ≥ <b style={{ color: T.fg }}>{threshold}</b>. The 5 names reshuffle as tape changes.</>
                 : <>
-              Each stock gets a 0–100 “busy” score from volume spikes, options/futures OI (if available),
-              price stretching away from the day’s average (VWAP), and buy vs sell pressure.
-              An alert only appears if the score reaches <b style={{ color: T.fg }}>{threshold}</b> — that bar is set high so you are not flooded.
-              Empty feed = the system thinks nothing unusual is going on. That is OK.
+              Live ranking of the 5 busiest heavy names (0–100). The list reshuffles as volume, VWAP, and pressure change.
+              An alert only appears if the score reaches <b style={{ color: T.fg }}>{threshold}</b>. Empty feed = quiet. That is OK.
                 </>}
             </Hint>
           </div>
@@ -2604,16 +2616,16 @@ function ContributionAlertsView({ backendUrl }) {
           ))}
         </div>
 
-        <div style={{ fontSize: 14, fontWeight: 700, marginTop: 16, marginBottom: 4 }}>Busy-ness of each heavy stock</div>
-        <Hint>{narrow ? "Higher = more unusual. Teal quiet · amber elevated · pink would-alert." : "Higher score = more unusual vs that stock’s own recent tape. Colour: quiet (teal), elevated (amber), would-alert (pink)."}</Hint>
+        <div style={{ fontSize: 14, fontWeight: 700, marginTop: 16, marginBottom: 4 }}>Live top 5 busy-ness</div>
+        <Hint>{narrow ? "Higher = more unusual. Ranking updates with each poll." : "Higher score = more unusual vs that stock’s own recent tape. Ranking updates every few seconds. Colour: quiet (teal), elevated (amber), would-alert (pink)."}</Hint>
         {narrow ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-            {scored.map((s) => (
+            {scored.map((s, i) => (
               <div key={s.symbol} style={{
                 background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 12px",
               }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
-                  <div style={{ fontFamily: DISP, fontWeight: 700 }}>{s.symbol}</div>
+                  <div style={{ fontFamily: DISP, fontWeight: 700 }}>{i + 1}. {s.symbol}</div>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontFamily: MONO, fontWeight: 700, fontSize: 18, color: urgencyColor(s.score) }}>{fmt(s.score, 0)}</div>
                     <div style={{ fontFamily: DISP, fontSize: 10, color: T.muted }}>{urgencyLabel(s.score)}</div>
@@ -2648,6 +2660,7 @@ function ContributionAlertsView({ backendUrl }) {
           <table style={{ width: "100%", minWidth: 520, borderCollapse: "collapse", fontFamily: MONO, fontSize: 11 }}>
             <thead>
               <tr style={{ color: T.muted, textAlign: "left" }}>
+                <Th>#</Th>
                 <Th>Stock</Th>
                 <Th hint="0 quiet → 100 extreme">Busy score</Th>
                 <Th hint="1 = normal volume, 3 = 3× usual">Volume</Th>
@@ -2657,8 +2670,9 @@ function ContributionAlertsView({ backendUrl }) {
               </tr>
             </thead>
             <tbody>
-              {scored.map((s) => (
+              {scored.map((s, i) => (
                 <tr key={s.symbol}>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88`, color: T.muted }}>{i + 1}</td>
                   <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{s.symbol}</td>
                   <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88`, color: urgencyColor(s.score), fontWeight: 700 }}>
                     {fmt(s.score, 0)}
@@ -2671,7 +2685,7 @@ function ContributionAlertsView({ backendUrl }) {
                 </tr>
               ))}
               {!scored.length && (
-                <tr><td colSpan={6} style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>No scores until Upstox is connected.</td></tr>
+                <tr><td colSpan={7} style={{ padding: 16, color: T.muted, textAlign: "center", fontFamily: DISP }}>No scores until Upstox is connected.</td></tr>
               )}
             </tbody>
           </table>
