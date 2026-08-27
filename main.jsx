@@ -41,6 +41,32 @@ const SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"];
 // TradingView" in the embedded widget). This just links out to the real
 // chart on their site instead, which isn't restricted.
 const TV_PAGE_SYMBOL = { NIFTY: "NSE-NIFTY", BANKNIFTY: "NSE-BANKNIFTY", FINNIFTY: "NSE-CNXFINANCE" };
+const TV_STOCK_ALIAS = { TMPV: "TATAMOTORS", "M&M": "M&M" };
+
+function tvStockUrl(symbol) {
+  const raw = TV_STOCK_ALIAS[symbol] || symbol || "";
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`NSE:${raw}`)}`;
+}
+
+function StockTvLink({ symbol, name, prefix, color }) {
+  if (!symbol) return null;
+  return (
+    <a
+      href={tvStockUrl(symbol)}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`Open ${symbol} on TradingView`}
+      style={{ color: color || T.cyan, textDecoration: "none", display: "inline-block" }}
+    >
+      <span style={{ fontWeight: 700, borderBottom: `1px dashed ${T.cyan}66` }}>
+        {prefix != null ? `${prefix}. ${symbol}` : symbol}
+      </span>
+      {name && (
+        <span style={{ display: "block", fontWeight: 400, fontSize: 10, color: T.muted, marginTop: 2 }}>{name} ↗</span>
+      )}
+    </a>
+  );
+}
 
 /* ---------- live spot-price chart (our own data, same pipeline as PCR) ---------- */
 /* candlestick body+wick, drawn via a custom Bar shape. y/height from Recharts
@@ -2494,8 +2520,7 @@ function ContributionAlertsView({ backendUrl }) {
               }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontFamily: DISP, fontWeight: 700 }}>{i + 1}. {s.symbol}</div>
-                    <div style={{ fontFamily: DISP, fontSize: 11, color: T.muted }}>{s.name}</div>
+                    <StockTvLink symbol={s.symbol} name={s.name} prefix={i + 1} />
                   </div>
                   <div style={{
                     fontFamily: MONO, fontWeight: 700, fontSize: 16,
@@ -2542,8 +2567,7 @@ function ContributionAlertsView({ backendUrl }) {
                 <tr key={s.symbol} style={{ color: s.quote_stale ? T.muted : T.fg }}>
                   <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: T.muted }}>{i + 1}</td>
                   <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>
-                    <div style={{ fontFamily: DISP, fontWeight: 600 }}>{s.symbol}</div>
-                    <div style={{ color: T.muted, fontSize: 10 }}>{s.name}</div>
+                    <StockTvLink symbol={s.symbol} name={s.name} />
                   </td>
                   <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88` }}>{fmt(s.weight_pct, 1)}%</td>
                   <td style={{ padding: "7px 8px", borderBottom: `1px solid ${T.line}88`, color: (s.pct_change || 0) >= 0 ? T.put : T.call }}>{fmtSigned(s.pct_change, 2)}%</td>
@@ -2608,7 +2632,9 @@ function ContributionAlertsView({ backendUrl }) {
               borderBottom: `1px solid ${T.line}`, padding: "8px 0",
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-                <div style={{ fontFamily: DISP, fontSize: 13, color: T.fg }}>{a.symbol} · score {fmt(a.score, 0)}</div>
+                <div style={{ fontFamily: DISP, fontSize: 13, color: T.fg }}>
+                  <StockTvLink symbol={a.symbol} /> · score {fmt(a.score, 0)}
+                </div>
                 <div style={{ fontFamily: MONO, fontSize: 10, color: T.muted }}>{a.fired_at ? new Date(a.fired_at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }) : ""} IST</div>
               </div>
               <div style={{ fontFamily: DISP, fontSize: 12, color: T.muted, marginTop: 4, lineHeight: 1.4 }}>{a.message}</div>
@@ -2625,7 +2651,7 @@ function ContributionAlertsView({ backendUrl }) {
                 background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 12px",
               }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
-                  <div style={{ fontFamily: DISP, fontWeight: 700 }}>{i + 1}. {s.symbol}</div>
+                  <div style={{ fontFamily: DISP, fontWeight: 700 }}><StockTvLink symbol={s.symbol} prefix={i + 1} /></div>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontFamily: MONO, fontWeight: 700, fontSize: 18, color: urgencyColor(s.score) }}>{fmt(s.score, 0)}</div>
                     <div style={{ fontFamily: DISP, fontSize: 10, color: T.muted }}>{urgencyLabel(s.score)}</div>
@@ -2673,7 +2699,9 @@ function ContributionAlertsView({ backendUrl }) {
               {scored.map((s, i) => (
                 <tr key={s.symbol}>
                   <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88`, color: T.muted }}>{i + 1}</td>
-                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>{s.symbol}</td>
+                  <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88` }}>
+                    <StockTvLink symbol={s.symbol} />
+                  </td>
                   <td style={{ padding: "6px 8px", borderBottom: `1px solid ${T.line}88`, color: urgencyColor(s.score), fontWeight: 700 }}>
                     {fmt(s.score, 0)}
                     <div style={{ fontFamily: DISP, fontSize: 10, fontWeight: 400, color: T.muted }}>{urgencyLabel(s.score)}</div>
